@@ -18,6 +18,9 @@ use std::time::Instant;
 
 type Id = u32;
 const MISSING_ID: Id = Id::MAX;
+const INVALID_EVENT_TS: i64 = i64::MIN;
+const INVALID_PRICE_CENTS: u32 = 0;
+const INVALID_EVENT_KIND: u8 = u8::MAX;
 type FastMap<K, V> = HashMap<K, V, RandomState>;
 type FastSet<K> = HashSet<K, RandomState>;
 type ShardEventMap = hashbrown::HashMap<u64, (IdRef, Event), BuildHasherDefault<IdentityHasher>>;
@@ -119,9 +122,8 @@ impl EventShard {
                 let (stored_id, stored_event) = entry.get_mut();
                 let stored = &self.ids[stored_id.start..stored_id.start + stored_id.len];
                 if stored == id.bytes() {
-                    if (event.ingest, event.file_order)
-                        < (stored_event.ingest, stored_event.file_order)
-                    {
+                    // Equal-ingest copies are identical under the track rules.
+                    if event.ingest < stored_event.ingest {
                         *stored_event = event;
                     }
                     return;
@@ -131,9 +133,7 @@ impl EventShard {
                     .iter_mut()
                     .find(|(key, _)| &self.ids[key.start..key.start + key.len] == id.bytes())
                 {
-                    if (event.ingest, event.file_order)
-                        < (stored_event.ingest, stored_event.file_order)
-                    {
+                    if event.ingest < stored_event.ingest {
                         *stored_event = event;
                     }
                 } else {
@@ -265,14 +265,15 @@ impl Dsu {
 
 #[derive(Clone, Copy)]
 struct Event {
-    user: Option<Id>,
-    ts: Option<i64>,
-    kind: u8,
-    product: Id,
-    price: Option<i64>,
+    ts: i64,
     ingest: i64,
-    file_order: u32,
+    user: Id,
+    product: Id,
+    price: u32,
+    kind: u8,
 }
+
+const _: () = assert!(std::mem::size_of::<Event>() == 32);
 
 #[derive(Clone, Copy)]
 struct Click {
@@ -322,8 +323,8 @@ fn aggregate_user_group(
     user_rows: &mut Vec<((Id, i32), UserAgg)>,
     sessions: &mut Vec<Session>,
 ) {
-    let person = events[0].user.unwrap();
-    let first_ts = events[0].ts.unwrap();
+    let person = events[0].user;
+    let first_ts = events[0].ts;
     let mut session_start = first_ts;
     let mut session_day = day(first_ts);
     let mut user_day = session_day;
@@ -333,7 +334,7 @@ fn aggregate_user_group(
     let mut previous_ts = first_ts;
 
     for (index, event) in events.iter().enumerate() {
-        let ts = event.ts.unwrap();
+        let ts = event.ts;
         let new_session = index == 0 || ts - previous_ts > SESSION_GAP_MS;
         if index > 0 && new_session {
             sessions.push(Session {
@@ -356,7 +357,7 @@ fn aggregate_user_group(
 
         daily.events += 1;
         if event.kind == 2 {
-            let amount = event.price.unwrap();
+            let amount = i64::from(event.price);
             session_revenue += amount;
             session_purchase = true;
             daily.revenue += amount;
@@ -770,7 +771,6 @@ fn parse_campaigns(data: &Path, strings: &mut Interner) -> Result<FastMap<Id, Id
 
 fn parse_event_file(
     path: &Path,
-    file_order: u32,
 ) -> Result<(Box<[u8]>, BorrowedInterner, Vec<(u64, StrRef, Event)>), String> {
     let bytes = fs::read(path)
         .map_err(|e| format!("read {}: {e}", path.display()))?
@@ -786,11 +786,16 @@ fn parse_event_file(
             b"view" => 0,
             b"cart" => 1,
             b"purchase" => 2,
-            _ => 255,
+            _ => INVALID_EVENT_KIND,
         };
         let event = Event {
-            user: (!row[1].is_empty()).then(|| strings.intern(row[1])),
-            ts: timestamp_with_cache(row[2], &mut years),
+            ts: timestamp_with_cache(row[2], &mut years).unwrap_or(INVALID_EVENT_TS),
+            ingest: f1_timestamp_unchecked(row[3], &mut years),
+            user: if row[1].is_empty() {
+                MISSING_ID
+            } else {
+                strings.intern(row[1])
+            },
             kind,
             product: if row[5].is_empty() {
                 MISSING_ID
@@ -799,9 +804,13 @@ fn parse_event_file(
             } else {
                 0
             },
-            price: (kind == 2).then(|| price(row[6])).flatten(),
-            ingest: f1_timestamp_unchecked(row[3], &mut years),
-            file_order,
+            price: if kind == 2 {
+                price(row[6])
+                    .map(|amount| amount as u32)
+                    .unwrap_or(INVALID_PRICE_CENTS)
+            } else {
+                INVALID_PRICE_CENTS
+            },
         };
         let id = StrRef::new(row[0]);
         let mut hasher = AHasher::default();
@@ -815,18 +824,17 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
     let paths = csv_files(&data.join("events"))?;
     let mut sized_paths = paths
         .into_iter()
-        .enumerate()
-        .map(|(order, path)| {
+        .map(|path| {
             let size = fs::metadata(&path)
                 .map_err(|error| format!("stat {}: {error}", path.display()))?
                 .len();
-            Ok((order as u32, path, size))
+            Ok((path, size))
         })
         .collect::<Result<Vec<_>, String>>()?;
-    sized_paths.sort_unstable_by_key(|(_, _, size)| Reverse(*size));
+    sized_paths.sort_unstable_by_key(|(_, size)| Reverse(*size));
     let mut buckets = (0..ncpu).map(|_| Vec::new()).collect::<Vec<_>>();
     let mut bucket_bytes = vec![0u64; ncpu];
-    for (order, path, size) in sized_paths {
+    for (path, size) in sized_paths {
         let bucket = bucket_bytes
             .iter()
             .enumerate()
@@ -834,7 +842,7 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
             .map(|(index, _)| index)
             .unwrap();
         bucket_bytes[bucket] += size;
-        buckets[bucket].push((order, path));
+        buckets[bucket].push(path);
     }
     let estimated_events = bucket_bytes.iter().sum::<u64>() as usize / 76;
     let shard_capacity = estimated_events.div_ceil(ncpu);
@@ -849,7 +857,7 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
             .collect::<Vec<_>>();
         let parsed = batch
             .par_iter()
-            .map(|(order, path)| parse_event_file(path, *order))
+            .map(|path| parse_event_file(path))
             .collect::<Result<Vec<_>, _>>()?;
         let mut source_buffers = Vec::with_capacity(parsed.len());
         let mut partitions = (0..ncpu).map(|_| Vec::new()).collect::<Vec<_>>();
@@ -861,7 +869,9 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
                 .map(|value| strings.intern(text(value.bytes()).unwrap()))
                 .collect::<Vec<_>>();
             for (hash, id, mut event) in local_events {
-                event.user = event.user.map(|id| remap[id as usize]);
+                if event.user != MISSING_ID {
+                    event.user = remap[event.user as usize];
+                }
                 if event.product != MISSING_ID && event.kind == 2 {
                     event.product = remap[event.product as usize];
                 }
@@ -1060,22 +1070,20 @@ fn run() -> Result<(), String> {
 
     let mut surviving = Vec::with_capacity(events.len());
     for mut e in events {
-        let (Some(user), Some(ts)) = (e.user, e.ts) else {
-            continue;
-        };
-        if ts < start
-            || ts >= end
+        if e.user == MISSING_ID
+            || e.ts == INVALID_EVENT_TS
+            || e.ts < start
+            || e.ts >= end
             || e.product == MISSING_ID
             || e.kind > 2
-            || (e.kind == 2 && e.price.is_none())
+            || (e.kind == 2 && e.price == INVALID_PRICE_CENTS)
         {
             continue;
         }
-        if (e.ingest as i128) - (ts as i128) > 86_400_000 {
+        if (e.ingest as i128) - (e.ts as i128) > 86_400_000 {
             continue;
         }
-        e.user = Some(dsu.canonical(user));
-        e.ts = Some(ts);
+        e.user = dsu.canonical(e.user);
         surviving.push(e);
     }
     for c in &mut raw_clicks {
@@ -1095,7 +1103,7 @@ fn run() -> Result<(), String> {
     );
 
     let phase = Instant::now();
-    surviving.par_sort_unstable_by_key(|e| (e.user.unwrap(), e.ts.unwrap()));
+    surviving.par_sort_unstable_by_key(|e| (e.user, e.ts));
     raw_clicks.par_sort_unstable_by_key(|c| (c.user, c.ts));
     eprintln!(
         "sorted events and clicks in {:.3}s",
@@ -1105,9 +1113,9 @@ fn run() -> Result<(), String> {
     let mut user_ranges = Vec::new();
     let mut i = 0;
     while i < surviving.len() {
-        let person = surviving[i].user.unwrap();
+        let person = surviving[i].user;
         let mut end = i + 1;
-        while end < surviving.len() && surviving[end].user == Some(person) {
+        while end < surviving.len() && surviving[end].user == person {
             end += 1;
         }
         user_ranges.push((i, end));
