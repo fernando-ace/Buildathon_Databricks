@@ -814,7 +814,7 @@ fn parse_event_file(
         };
         let id = StrRef::new(row[0]);
         let mut hasher = AHasher::default();
-        id.hash(&mut hasher);
+        hasher.write(row[0]);
         events.push((hasher.finish(), id, event));
     });
     Ok((bytes, strings, events))
@@ -968,7 +968,7 @@ fn parse_clicks(
                 click.user = remap[click.user as usize];
                 click.campaign = remap[click.campaign as usize];
                 let mut hasher = AHasher::default();
-                click.id.hash(&mut hasher);
+                hasher.write(click.id.bytes());
                 let hash = hasher.finish();
                 partitions[hash as usize % ncpu].push(click);
             }
