@@ -133,18 +133,23 @@ impl EventDeduper {
         }
     }
 
-    fn into_records(self) -> Vec<(u64, StrRef, Event)> {
-        let collision_count = self.collisions.values().map(Vec::len).sum::<usize>();
-        let mut records = Vec::with_capacity(self.primary.len() + collision_count);
-        records.extend(
-            self.primary
-                .into_iter()
-                .map(|(hash, (id, event))| (hash, id, event)),
-        );
-        records.extend(self.collisions.into_iter().flat_map(|(hash, events)| {
-            events.into_iter().map(move |(id, event)| (hash, id, event))
-        }));
-        records
+    fn drain_into(self, partitions: &mut [Vec<(u64, StrRef, Event)>], remap: &[Id]) {
+        let push = |hash: u64,
+                    id: StrRef,
+                    mut event: Event,
+                    partitions: &mut [Vec<(u64, StrRef, Event)>]| {
+            event.user = event.user.map(|id| remap[id as usize]);
+            event.product = event.product.map(|id| remap[id as usize]);
+            partitions[hash as usize % partitions.len()].push((hash, id, event));
+        };
+        for (hash, (id, event)) in self.primary {
+            push(hash, id, event, partitions);
+        }
+        for (hash, events) in self.collisions {
+            for (id, event) in events {
+                push(hash, id, event, partitions);
+            }
+        }
     }
 }
 
@@ -570,17 +575,7 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
                 .iter()
                 .map(|value| strings.intern(text(value.bytes()).unwrap()))
                 .collect::<Vec<_>>();
-            for (hash, event_id, event) in local_events.into_records() {
-                let event = Event {
-                    user: event.user.map(|id| remap[id as usize]),
-                    ts: event.ts,
-                    kind: event.kind,
-                    product: event.product.map(|id| remap[id as usize]),
-                    price: event.price,
-                    ingest: event.ingest,
-                };
-                partitions[hash as usize % ncpu].push((hash, event_id, event));
-            }
+            local_events.drain_into(&mut partitions, &remap);
         }
         shards
             .par_iter_mut()
@@ -591,10 +586,21 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
                 }
             });
     }
-    let events = shards
-        .into_iter()
-        .flat_map(|shard| shard.into_records().into_iter().map(|(_, _, event)| event))
-        .collect();
+    let total_events = shards
+        .iter()
+        .map(|shard| shard.primary.len() + shard.collisions.values().map(Vec::len).sum::<usize>())
+        .sum();
+    let mut events = Vec::with_capacity(total_events);
+    for shard in shards {
+        events.extend(shard.primary.into_values().map(|(_, event)| event));
+        events.extend(
+            shard
+                .collisions
+                .into_values()
+                .flatten()
+                .map(|(_, event)| event),
+        );
+    }
     drop(source_buffers);
     Ok(events)
 }
