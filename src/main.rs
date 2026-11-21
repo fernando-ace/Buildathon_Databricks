@@ -1029,7 +1029,14 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
         let file_partitions = prepared
             .into_par_iter()
             .map(|(source, chunks)| {
-                let mut partitions = (0..ncpu).map(|_| Vec::new()).collect::<Vec<_>>();
+                let partition_capacity = chunks
+                    .iter()
+                    .map(|(events, _)| events.len())
+                    .sum::<usize>()
+                    .div_ceil(ncpu);
+                let mut partitions = (0..ncpu)
+                    .map(|_| Vec::with_capacity(partition_capacity))
+                    .collect::<Vec<_>>();
                 for (local_events, remap) in chunks {
                     for (hash, id, mut event) in local_events {
                         if event.user != MISSING_ID {
