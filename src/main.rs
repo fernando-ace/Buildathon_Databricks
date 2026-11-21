@@ -99,9 +99,12 @@ struct EventShard {
 }
 
 impl EventShard {
-    fn new() -> Self {
+    fn with_capacity(capacity: usize) -> Self {
         Self {
-            primary: ShardEventMap::default(),
+            primary: ShardEventMap::with_capacity_and_hasher(
+                capacity,
+                BuildHasherDefault::default(),
+            ),
             collisions: fast_map(),
             ids: Vec::new(),
         }
@@ -168,9 +171,12 @@ impl EventShard {
 }
 
 impl EventDeduper {
-    fn new() -> Self {
+    fn with_capacity(capacity: usize) -> Self {
         Self {
-            primary: LocalEventMap::default(),
+            primary: LocalEventMap::with_capacity_and_hasher(
+                capacity,
+                BuildHasherDefault::default(),
+            ),
             collisions: fast_map(),
         }
     }
@@ -754,7 +760,7 @@ fn parse_event_file(
         .map_err(|e| format!("read {}: {e}", path.display()))?
         .into_boxed_slice();
     let mut strings = BorrowedInterner::default();
-    let mut events = EventDeduper::new();
+    let mut events = EventDeduper::with_capacity(bytes.len() / 76);
     each_utf8_row_bytes::<7, _>(&bytes, |row| {
         if row[0].is_empty() {
             return;
@@ -804,7 +810,11 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
         bucket_bytes[bucket] += size;
         buckets[bucket].push((order, path));
     }
-    let mut shards = (0..ncpu).map(|_| EventShard::new()).collect::<Vec<_>>();
+    let estimated_events = bucket_bytes.iter().sum::<u64>() as usize / 76;
+    let shard_capacity = estimated_events.div_ceil(ncpu);
+    let mut shards = (0..ncpu)
+        .map(|_| EventShard::with_capacity(shard_capacity))
+        .collect::<Vec<_>>();
     let batch_count = buckets.iter().map(Vec::len).max().unwrap_or(0);
     for batch_index in 0..batch_count {
         let batch = buckets
