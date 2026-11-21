@@ -223,14 +223,12 @@ impl BorrowedInterner {
 
 struct Dsu {
     parent: Vec<Id>,
-    min_id: Vec<Id>,
 }
 
 impl Dsu {
     fn new(n: usize) -> Self {
         Self {
             parent: (0..n as Id).collect(),
-            min_id: (0..n as Id).collect(),
         }
     }
 
@@ -254,22 +252,14 @@ impl Dsu {
         if ra == rb {
             return;
         }
-        let ma = self.min_id[ra as usize];
-        let mb = self.min_id[rb as usize];
-        if strings.get(ma).as_bytes() > strings.get(mb).as_bytes() {
+        if strings.get(ra).as_bytes() > strings.get(rb).as_bytes() {
             std::mem::swap(&mut ra, &mut rb);
         }
         self.parent[rb as usize] = ra;
-        let ca = self.min_id[ra as usize];
-        let cb = self.min_id[rb as usize];
-        if strings.get(cb).as_bytes() < strings.get(ca).as_bytes() {
-            self.min_id[ra as usize] = cb;
-        }
     }
 
     fn canonical(&mut self, id: Id) -> Id {
-        let r = self.root(id);
-        self.min_id[r as usize]
+        self.root(id)
     }
 }
 
