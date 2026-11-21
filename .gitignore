@@ -1,0 +1,6 @@
+/target/
+/output/
+/scratch/
+/data/
+*.parquet
+

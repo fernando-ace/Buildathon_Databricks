@@ -1,0 +1,28 @@
+# Shopping Sessions
+
+A native Rust implementation of the Builders / Databricks Shopping Sessions
+track. It reads the CSV files from `DATA_DIR` and writes the two required
+Parquet tables under `OUTPUT_DIR`.
+
+## Build and run
+
+```sh
+docker buildx build --platform linux/amd64 --load -t shopping-sessions .
+docker run --rm --cpus=8 --memory=24g --read-only --tmpfs /tmp:rw,size=64m \
+  -v ./data:/data:ro -v ./output:/output:rw -v ./scratch:/scratch:rw \
+  shopping-sessions
+```
+
+The image has no runtime network dependency. At runtime, data is read-only and
+temporary state is restricted to `/scratch` and `/tmp`.
+
+## Correctness checks
+
+Install the test reader with `python -m pip install -r requirements-test.txt`.
+The public 36 fixtures are in `tests/fixtures`; run `make fixtures` to execute
+the native release binary against all of them. Generate the public dev input
+with the track's `generate` utility, then run `make dev-check` to compare it
+with the supplied answer (the generated `dev/` input is not committed).
+
+Rules and scorer contract: <https://www.joinbuilders.org/buildathon/tracks/shopping-sessions>.
+
