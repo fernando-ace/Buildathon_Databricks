@@ -258,8 +258,8 @@ impl Dsu {
         self.parent[rb as usize] = ra;
     }
 
-    fn canonical(&mut self, id: Id) -> Id {
-        self.root(id)
+    fn canonical(&self, id: Id) -> Id {
+        self.parent[id as usize]
     }
 }
 
@@ -1063,8 +1063,14 @@ fn run() -> Result<(), String> {
         phase.elapsed().as_secs_f64()
     );
     let mut dsu = Dsu::new(strings.values.len());
-    for (a, b) in links {
+    for &(a, b) in &links {
         dsu.union(a, b, &strings);
+    }
+    // Every ID with a non-root parent comes from the link table. Flatten these
+    // once so canonicalization in the event and click loops is one array read.
+    for &(a, b) in &links {
+        dsu.root(a);
+        dsu.root(b);
     }
     let phase = Instant::now();
 
