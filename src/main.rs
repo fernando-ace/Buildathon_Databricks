@@ -738,12 +738,14 @@ where
     }
 }
 
-fn each_utf8_row_bytes<const N: usize, F>(bytes: &[u8], mut f: F)
+fn each_utf8_row_bytes<const N: usize, F>(bytes: &[u8], skip_header: bool, mut f: F)
 where
     F: FnMut([&[u8]; N]),
 {
     let mut lines = bytes.split(|b| *b == b'\n');
-    let _header = lines.next();
+    if skip_header {
+        let _header = lines.next();
+    }
     for line in lines {
         if std::str::from_utf8(line).is_ok() {
             if let Some(row) = fields::<N>(line) {
@@ -796,16 +798,14 @@ fn parse_campaigns(data: &Path, strings: &mut Interner) -> Result<FastMap<Id, Id
     Ok(campaigns)
 }
 
-fn parse_event_file(
-    path: &Path,
-) -> Result<(Box<[u8]>, BorrowedInterner, Vec<(u64, StrRef, Event)>), String> {
-    let bytes = fs::read(path)
-        .map_err(|e| format!("read {}: {e}", path.display()))?
-        .into_boxed_slice();
+fn parse_event_chunk(
+    bytes: &[u8],
+    skip_header: bool,
+) -> (BorrowedInterner, Vec<(u64, StrRef, Event)>) {
     let mut strings = BorrowedInterner::with_capacity(bytes.len() / 152);
     let mut events = Vec::with_capacity(bytes.len() / 76);
     let mut years = YearStartCache::default();
-    each_utf8_row_bytes::<7, _>(&bytes, |row| {
+    each_utf8_row_bytes::<7, _>(bytes, skip_header, |row| {
         if row[0].is_empty() {
             return;
         }
@@ -844,7 +844,36 @@ fn parse_event_file(
         hasher.write(row[0]);
         events.push((hasher.finish(), id, event));
     });
-    Ok((bytes, strings, events))
+    (strings, events)
+}
+
+fn parse_event_file(
+    path: &Path,
+) -> Result<(Box<[u8]>, Vec<(BorrowedInterner, Vec<(u64, StrRef, Event)>)>), String> {
+    const CHUNK_SIZE: usize = 16 * 1024 * 1024;
+    let bytes = fs::read(path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?
+        .into_boxed_slice();
+    let mut ranges = Vec::with_capacity(bytes.len().div_ceil(CHUNK_SIZE));
+    let mut start = 0;
+    while start < bytes.len() {
+        let target = (start + CHUNK_SIZE).min(bytes.len());
+        let end = if target == bytes.len() {
+            bytes.len()
+        } else {
+            target
+                + memchr(b'\n', &bytes[target..])
+                    .map_or(bytes.len() - target, |offset| offset + 1)
+        };
+        ranges.push((start, end));
+        start = end;
+    }
+
+    let parsed = ranges
+        .par_iter()
+        .map(|&(start, end)| parse_event_chunk(&bytes[start..end], start == 0))
+        .collect::<Vec<_>>();
+    Ok((bytes, parsed))
 }
 
 fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<Event>, String> {
@@ -891,26 +920,34 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
             .map(|path| parse_event_file(path))
             .collect::<Result<Vec<_>, _>>()?;
         let mut prepared = Vec::with_capacity(parsed.len());
-        for (source, local_strings, local_events) in parsed {
-            let remap = local_strings
-                .values
-                .iter()
-                .map(|value| strings.intern(text(value.bytes()).unwrap()))
+        for (source, chunks) in parsed {
+            let chunks = chunks
+                .into_iter()
+                .map(|(local_strings, local_events)| {
+                    let remap = local_strings
+                        .values
+                        .iter()
+                        .map(|value| strings.intern(text(value.bytes()).unwrap()))
+                        .collect::<Vec<_>>();
+                    (local_events, remap)
+                })
                 .collect::<Vec<_>>();
-            prepared.push((source, local_events, remap));
+            prepared.push((source, chunks));
         }
         let file_partitions = prepared
             .into_par_iter()
-            .map(|(source, local_events, remap)| {
+            .map(|(source, chunks)| {
                 let mut partitions = (0..ncpu).map(|_| Vec::new()).collect::<Vec<_>>();
-                for (hash, id, mut event) in local_events {
-                    if event.user != MISSING_ID {
-                        event.user = remap[event.user as usize];
+                for (local_events, remap) in chunks {
+                    for (hash, id, mut event) in local_events {
+                        if event.user != MISSING_ID {
+                            event.user = remap[event.user as usize];
+                        }
+                        if event.product != MISSING_ID && event.kind == 2 {
+                            event.product = remap[event.product as usize];
+                        }
+                        partitions[hash as usize % ncpu].push((hash, id, event));
                     }
-                    if event.product != MISSING_ID && event.kind == 2 {
-                        event.product = remap[event.product as usize];
-                    }
-                    partitions[hash as usize % ncpu].push((hash, id, event));
                 }
                 (source, partitions)
             })
