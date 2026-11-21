@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 type Id = u32;
+const MISSING_ID: Id = Id::MAX;
 type FastMap<K, V> = HashMap<K, V, RandomState>;
 type FastSet<K> = HashSet<K, RandomState>;
 type LocalEventMap = hashbrown::HashMap<u64, (StrRef, Event), BuildHasherDefault<IdentityHasher>>;
@@ -230,7 +231,9 @@ impl EventDeduper {
                     mut event: Event,
                     partitions: &mut [Vec<(u64, StrRef, Event)>]| {
             event.user = event.user.map(|id| remap[id as usize]);
-            event.product = event.product.map(|id| remap[id as usize]);
+            if event.product != MISSING_ID && event.kind == 2 {
+                event.product = remap[event.product as usize];
+            }
             partitions[hash as usize % partitions.len()].push((hash, id, event));
         };
         for (hash, (id, event)) in self.primary {
@@ -347,7 +350,7 @@ struct Event {
     user: Option<Id>,
     ts: Option<i64>,
     kind: u8,
-    product: Option<Id>,
+    product: Id,
     price: Option<i64>,
     ingest: i64,
     file_order: u32,
@@ -439,8 +442,7 @@ fn aggregate_user_group(
             session_revenue += amount;
             session_purchase = true;
             daily.revenue += amount;
-            let product = event.product.unwrap();
-            let category = *products.get(&product).unwrap_or(&unknown);
+            let category = *products.get(&event.product).unwrap_or(&unknown);
             *daily.categories.entry(category).or_default() += amount;
         }
         if new_session {
@@ -775,7 +777,13 @@ fn parse_event_file(
             user: (!row[1].is_empty()).then(|| strings.intern(row[1])),
             ts: timestamp(row[2]),
             kind,
-            product: (!row[5].is_empty()).then(|| strings.intern(row[5])),
+            product: if row[5].is_empty() {
+                MISSING_ID
+            } else if kind == 2 {
+                strings.intern(row[5])
+            } else {
+                0
+            },
             price: (kind == 2).then(|| price(row[6])).flatten(),
             ingest: timestamp(row[3]).unwrap_or(i64::MAX),
             file_order,
@@ -1027,10 +1035,15 @@ fn run() -> Result<(), String> {
 
     let mut surviving = Vec::with_capacity(events.len());
     for mut e in events {
-        let (Some(user), Some(ts), Some(product)) = (e.user, e.ts, e.product) else {
+        let (Some(user), Some(ts)) = (e.user, e.ts) else {
             continue;
         };
-        if ts < start || ts >= end || e.kind > 2 || (e.kind == 2 && e.price.is_none()) {
+        if ts < start
+            || ts >= end
+            || e.product == MISSING_ID
+            || e.kind > 2
+            || (e.kind == 2 && e.price.is_none())
+        {
             continue;
         }
         if (e.ingest as i128) - (ts as i128) > 86_400_000 {
@@ -1038,7 +1051,6 @@ fn run() -> Result<(), String> {
         }
         e.user = Some(dsu.canonical(user));
         e.ts = Some(ts);
-        let _ = product;
         surviving.push(e);
     }
     for c in &mut raw_clicks {
