@@ -877,7 +877,7 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
         .map(|_| EventShard::with_capacity(shard_capacity))
         .collect::<Vec<_>>();
     let batch_count = buckets.iter().map(Vec::len).max().unwrap_or(0);
-    let batch_width = 4;
+    let batch_width = 8;
     for batch_start in (0..batch_count).step_by(batch_width) {
         let batch = buckets
             .iter()
