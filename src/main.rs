@@ -2,6 +2,7 @@ use ahash::{AHasher, RandomState};
 use arrow_array::{ArrayRef, Date32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use memchr::{memchr, memchr_iter, memchr2};
+use memmap2::{Mmap, MmapOptions};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -504,6 +505,13 @@ fn csv_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(paths)
 }
 
+fn map_file(path: &Path) -> Result<Mmap, String> {
+    let file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    // Input files are immutable for the duration of a run.
+    unsafe { MmapOptions::new().map(&file) }
+        .map_err(|e| format!("map {}: {e}", path.display()))
+}
+
 fn fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
     if line.is_empty() {
         return None;
@@ -900,15 +908,13 @@ fn parse_event_file(
     path: &Path,
 ) -> Result<
     (
-        Box<[u8]>,
+        Mmap,
         Vec<(BorrowedInterner, Vec<(u64, StrRef, Event)>)>,
     ),
     String,
 > {
     const CHUNK_SIZE: usize = 16 * 1024 * 1024;
-    let bytes = fs::read(path)
-        .map_err(|e| format!("read {}: {e}", path.display()))?
-        .into_boxed_slice();
+    let bytes = map_file(path)?;
     let mut ranges = Vec::with_capacity(bytes.len().div_ceil(CHUNK_SIZE));
     let mut start = 0;
     while start < bytes.len() {
@@ -1040,10 +1046,8 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
     Ok(events)
 }
 
-fn parse_click_file(path: &Path) -> Result<(Box<[u8]>, BorrowedInterner, Vec<RawClick>), String> {
-    let bytes = fs::read(path)
-        .map_err(|e| format!("read {}: {e}", path.display()))?
-        .into_boxed_slice();
+fn parse_click_file(path: &Path) -> Result<(Mmap, BorrowedInterner, Vec<RawClick>), String> {
+    let bytes = map_file(path)?;
     let mut strings = BorrowedInterner::with_capacity(bytes.len() / 100);
     let mut seen: FastSet<StrRef> = fast_set_with_capacity(bytes.len() / 64);
     let mut clicks = Vec::new();
@@ -1073,7 +1077,7 @@ fn parse_clicks(
     data: &Path,
     strings: &mut Interner,
     ncpu: usize,
-) -> Result<(Vec<Box<[u8]>>, Vec<RawClick>), String> {
+) -> Result<(Vec<Mmap>, Vec<RawClick>), String> {
     let paths = csv_files(&data.join("clicks"))?;
     let mut seen = (0..ncpu).map(|_| fast_set()).collect::<Vec<_>>();
     let mut source_buffers = Vec::with_capacity(paths.len());
