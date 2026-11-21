@@ -27,8 +27,7 @@ struct StrRef {
     len: usize,
 }
 
-// These pointers refer into Box<[u8]> buffers owned by the event-file batch.
-// The buffers are retained until the event-ID map is consumed.
+// These pointers refer into retained event/click input-file buffers.
 unsafe impl Send for StrRef {}
 unsafe impl Sync for StrRef {}
 
@@ -264,6 +263,14 @@ struct Event {
 #[derive(Clone, Copy)]
 struct Click {
     id: Id,
+    user: Id,
+    ts: i64,
+    campaign: Id,
+}
+
+#[derive(Clone, Copy)]
+struct RawClick {
+    id: StrRef,
     user: Id,
     ts: i64,
     campaign: Id,
@@ -605,11 +612,11 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
     Ok(events)
 }
 
-fn parse_click_file(path: &Path) -> Result<(Interner, Vec<Click>), String> {
+fn parse_click_file(path: &Path) -> Result<(Box<[u8]>, BorrowedInterner, Vec<RawClick>), String> {
     let bytes = fs::read(path)
         .map_err(|e| format!("read {}: {e}", path.display()))?
         .into_boxed_slice();
-    let mut strings = Interner::default();
+    let mut strings = BorrowedInterner::default();
     let mut seen: FastSet<StrRef> = fast_set();
     let mut clicks = Vec::new();
     each_row_bytes::<4, _>(&bytes, |row| {
@@ -622,43 +629,61 @@ fn parse_click_file(path: &Path) -> Result<(Interner, Vec<Click>), String> {
             return;
         }
         if let Some(ts) = timestamp(ts.as_bytes()) {
-            clicks.push(Click {
-                id: strings.intern(id),
-                user: strings.intern(user),
+            clicks.push(RawClick {
+                id: StrRef::new(row[0]),
+                user: strings.intern(user.as_bytes()),
                 ts,
-                campaign: strings.intern(campaign),
+                campaign: strings.intern(campaign.as_bytes()),
             });
         }
     });
-    Ok((strings, clicks))
+    Ok((bytes, strings, clicks))
 }
 
-fn parse_clicks(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<Click>, String> {
+fn parse_clicks(
+    data: &Path,
+    strings: &mut Interner,
+    ncpu: usize,
+) -> Result<(Vec<Box<[u8]>>, Vec<RawClick>), String> {
     let paths = csv_files(&data.join("clicks"))?;
-    let mut seen: FastSet<Id> = fast_set();
+    let mut seen = (0..ncpu).map(|_| fast_set()).collect::<Vec<_>>();
+    let mut source_buffers = Vec::with_capacity(paths.len());
     let mut clicks = Vec::new();
     for batch in paths.chunks(ncpu) {
         let parsed = batch
             .par_iter()
             .map(|path| parse_click_file(path))
             .collect::<Result<Vec<_>, _>>()?;
-        for (local_strings, local_clicks) in parsed {
+        let mut partitions = (0..ncpu).map(|_| Vec::new()).collect::<Vec<_>>();
+        for (source, local_strings, local_clicks) in parsed {
+            source_buffers.push(source);
             let remap = local_strings
                 .values
                 .iter()
-                .map(|value| strings.intern(value))
+                .map(|value| strings.intern(text(value.bytes()).unwrap()))
                 .collect::<Vec<_>>();
             for mut click in local_clicks {
-                click.id = remap[click.id as usize];
                 click.user = remap[click.user as usize];
                 click.campaign = remap[click.campaign as usize];
-                if seen.insert(click.id) {
-                    clicks.push(click);
-                }
+                let mut hasher = AHasher::default();
+                click.id.hash(&mut hasher);
+                let hash = hasher.finish();
+                partitions[hash as usize % ncpu].push(click);
             }
         }
+        let added = seen
+            .par_iter_mut()
+            .zip(partitions.into_par_iter())
+            .map(|(seen, candidates)| {
+                candidates
+                    .into_iter()
+                    .filter(|click| seen.insert(click.id))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        clicks.extend(added.into_iter().flatten());
     }
-    Ok(clicks)
+    Ok((source_buffers, clicks))
 }
 
 fn day(ts: i64) -> i32 {
@@ -744,7 +769,7 @@ fn run() -> Result<(), String> {
         phase.elapsed().as_secs_f64()
     );
     let phase = Instant::now();
-    let mut clicks = parse_clicks(&data, &mut strings, ncpu)?;
+    let (click_sources, mut raw_clicks) = parse_clicks(&data, &mut strings, ncpu)?;
     eprintln!(
         "parsed and deduplicated clicks in {:.3}s",
         phase.elapsed().as_secs_f64()
@@ -771,7 +796,7 @@ fn run() -> Result<(), String> {
         let _ = product;
         surviving.push(e);
     }
-    for c in &mut clicks {
+    for c in &mut raw_clicks {
         if c.ts < start.saturating_sub(ATTRIBUTION_MS)
             || c.ts >= end
             || !campaigns.contains_key(&c.campaign)
@@ -781,7 +806,7 @@ fn run() -> Result<(), String> {
             c.user = dsu.canonical(c.user);
         }
     }
-    clicks.retain(|c| c.ts != i64::MIN);
+    raw_clicks.retain(|c| c.ts != i64::MIN);
     eprintln!(
         "linked IDs and filtered records in {:.3}s",
         phase.elapsed().as_secs_f64()
@@ -789,7 +814,7 @@ fn run() -> Result<(), String> {
 
     let phase = Instant::now();
     surviving.par_sort_unstable_by_key(|e| (e.user.unwrap(), e.ts.unwrap()));
-    clicks.par_sort_unstable_by_key(|c| (c.user, c.ts));
+    raw_clicks.par_sort_unstable_by_key(|c| (c.user, c.ts));
     eprintln!(
         "sorted events and clicks in {:.3}s",
         phase.elapsed().as_secs_f64()
@@ -851,18 +876,32 @@ fn run() -> Result<(), String> {
         i = j;
     }
 
-    let mut click_rank: Vec<(Id, Id)> = clicks.iter().map(|c| (c.id, c.id)).collect();
     eprintln!(
         "sessionized and aggregated users in {:.3}s",
         phase.elapsed().as_secs_f64()
     );
     let phase = Instant::now();
-    click_rank
-        .sort_unstable_by(|a, b| strings.get(a.0).as_bytes().cmp(strings.get(b.0).as_bytes()));
-    let mut ranks = vec![0u32; strings.values.len()];
-    for (rank, (id, _)) in click_rank.into_iter().enumerate() {
-        ranks[id as usize] = rank as u32;
+    let mut click_rank = raw_clicks
+        .iter()
+        .enumerate()
+        .map(|(index, click)| (click.id, index))
+        .collect::<Vec<_>>();
+    click_rank.sort_unstable_by(|a, b| a.0.bytes().cmp(b.0.bytes()));
+    let mut ranks = vec![0u32; raw_clicks.len()];
+    for (rank, (_, index)) in click_rank.into_iter().enumerate() {
+        ranks[index] = rank as u32;
     }
+    let clicks = raw_clicks
+        .into_iter()
+        .zip(ranks)
+        .map(|(click, id)| Click {
+            id,
+            user: click.user,
+            ts: click.ts,
+            campaign: click.campaign,
+        })
+        .collect::<Vec<_>>();
+    drop(click_sources);
     let mut campaign_daily: FastMap<(Id, i32), CampaignAgg> = fast_map();
     let mut si = 0usize;
     let mut ci = 0usize;
@@ -886,14 +925,14 @@ fn run() -> Result<(), String> {
         for s in &sessions[si..se] {
             while add < person_clicks.len() && person_clicks[add].ts <= s.start {
                 let c = person_clicks[add];
-                active.insert((c.ts, Reverse(ranks[c.id as usize]), c.campaign));
+                active.insert((c.ts, Reverse(c.id), c.campaign));
                 *campaign_counts.entry(c.campaign).or_default() += 1;
                 add += 1;
             }
             let cutoff = s.start.saturating_sub(ATTRIBUTION_MS);
             while remove < add && person_clicks[remove].ts < cutoff {
                 let c = person_clicks[remove];
-                active.remove(&(c.ts, Reverse(ranks[c.id as usize]), c.campaign));
+                active.remove(&(c.ts, Reverse(c.id), c.campaign));
                 if let Some(n) = campaign_counts.get_mut(&c.campaign) {
                     *n -= 1;
                     if *n == 0 {
