@@ -2,5 +2,6 @@
 /output/
 /scratch/
 /data/
+__pycache__/
 *.parquet
 

@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 
 import polars as pl
+from runner import command
 
 SCHEMAS = {
     "user_daily": {
@@ -47,6 +48,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     default_binary = "target/release/shopping-sessions.exe" if os.name == "nt" else "target/release/shopping-sessions"
     parser.add_argument("--binary", default=default_binary)
+    parser.add_argument("--docker-image")
     parser.add_argument("--fixtures", default="tests/fixtures")
     args = parser.parse_args()
     binary = Path(args.binary).resolve()
@@ -59,9 +61,16 @@ def main() -> int:
             data = case / "data"
         with tempfile.TemporaryDirectory(prefix="shopping-sessions-") as temp:
             output = Path(temp) / "out"
+            scratch = Path(temp) / "scratch"
             output.mkdir()
-            env = dict(os.environ, DATA_DIR=str(data.resolve()), OUTPUT_DIR=str(output), SCRATCH_DIR=temp)
-            result = subprocess.run([binary], env=env, capture_output=True, text=True)
+            scratch.mkdir()
+            if args.docker_image:
+                cmd = command(binary, args.docker_image, data, output, scratch)
+                env = os.environ.copy()
+            else:
+                cmd = command(binary, None, data, output, scratch)
+                env = dict(os.environ, DATA_DIR=str(data.resolve()), OUTPUT_DIR=str(output), SCRATCH_DIR=str(scratch))
+            result = subprocess.run(cmd, env=env, capture_output=True, text=True)
             if result.returncode:
                 failed.append(case.name)
                 print(f"FAIL {case.name}: exit {result.returncode}\n{result.stderr[-1500:]}")

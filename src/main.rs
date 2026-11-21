@@ -13,6 +13,7 @@ use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 type Id = u32;
 type FastMap<K, V> = HashMap<K, V, RandomState>;
@@ -201,8 +202,28 @@ fn ascii_u64(bytes: &[u8]) -> Option<u64> {
     })
 }
 
-fn digits(bytes: &[u8]) -> Option<u32> {
-    ascii_u64(bytes).and_then(|n| u32::try_from(n).ok())
+#[inline]
+fn digit(b: u8) -> Option<i64> {
+    if b.is_ascii_digit() {
+        Some((b - b'0') as i64)
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn two_digits(bytes: &[u8], at: usize) -> Option<i64> {
+    Some(digit(bytes[at])? * 10 + digit(bytes[at + 1])?)
+}
+
+#[inline]
+fn four_digits(bytes: &[u8], at: usize) -> Option<i64> {
+    Some(
+        digit(bytes[at])? * 1_000
+            + digit(bytes[at + 1])? * 100
+            + digit(bytes[at + 2])? * 10
+            + digit(bytes[at + 3])?,
+    )
 }
 
 fn leap(year: i64) -> bool {
@@ -234,12 +255,12 @@ fn timestamp(bytes: &[u8]) -> Option<i64> {
     {
         return None;
     }
-    let year = digits(&bytes[0..4])? as i64;
-    let month = digits(&bytes[5..7])? as i64;
-    let day = digits(&bytes[8..10])? as i64;
-    let hour = digits(&bytes[11..13])? as i64;
-    let minute = digits(&bytes[14..16])? as i64;
-    let second = digits(&bytes[17..19])? as i64;
+    let year = four_digits(bytes, 0)?;
+    let month = two_digits(bytes, 5)?;
+    let day = two_digits(bytes, 8)?;
+    let hour = two_digits(bytes, 11)?;
+    let minute = two_digits(bytes, 14)?;
+    let second = two_digits(bytes, 17)?;
     let month_days = match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
@@ -259,8 +280,8 @@ fn timestamp(bytes: &[u8]) -> Option<i64> {
         if bytes[19] != b'+' && bytes[19] != b'-' || bytes[22] != b':' {
             return None;
         }
-        let oh = digits(&bytes[20..22])? as i64;
-        let om = digits(&bytes[23..25])? as i64;
+        let oh = two_digits(bytes, 20)?;
+        let om = two_digits(bytes, 23)?;
         if oh > 23 || om > 59 {
             return None;
         }
@@ -327,84 +348,143 @@ fn parse_campaigns(data: &Path, strings: &mut Interner) -> Result<FastMap<Id, Id
     Ok(campaigns)
 }
 
-fn parse_events(data: &Path, strings: &mut Interner) -> Result<Vec<Event>, String> {
+fn parse_event_file(path: &Path) -> Result<(Interner, FastMap<String, Event>), String> {
+    let mut strings = Interner::default();
     let mut events: FastMap<String, Event> = fast_map();
-    for path in csv_files(&data.join("events"))? {
-        each_row::<7, _>(&path, |row| {
-            let (
-                Some(event_id),
-                Some(user),
-                Some(ts),
-                Some(ingest),
-                Some(kind),
-                Some(product),
-                Some(price_raw),
-            ) = (
-                text(row[0]),
-                text(row[1]),
-                text(row[2]),
-                text(row[3]),
-                text(row[4]),
-                text(row[5]),
-                text(row[6]),
-            )
-            else {
-                return;
-            };
-            if event_id.is_empty() {
-                return;
+    each_row::<7, _>(path, |row| {
+        let (
+            Some(event_id),
+            Some(user),
+            Some(ts),
+            Some(ingest),
+            Some(kind),
+            Some(product),
+            Some(price_raw),
+        ) = (
+            text(row[0]),
+            text(row[1]),
+            text(row[2]),
+            text(row[3]),
+            text(row[4]),
+            text(row[5]),
+            text(row[6]),
+        )
+        else {
+            return;
+        };
+        if event_id.is_empty() {
+            return;
+        }
+        let kind = match kind.as_bytes() {
+            b"view" => 0,
+            b"cart" => 1,
+            b"purchase" => 2,
+            _ => 255,
+        };
+        let event = Event {
+            user: (!user.is_empty()).then(|| strings.intern(user)),
+            ts: timestamp(ts.as_bytes()),
+            kind,
+            product: (!product.is_empty()).then(|| strings.intern(product)),
+            price: (kind == 2).then(|| price(price_raw.as_bytes())).flatten(),
+            ingest: timestamp(ingest.as_bytes()).unwrap_or(i64::MAX),
+        };
+        match events.entry(event_id.to_owned()) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(event);
             }
-            let kind = match kind.as_bytes() {
-                b"view" => 0,
-                b"cart" => 1,
-                b"purchase" => 2,
-                _ => 255,
-            };
-            let event = Event {
-                user: (!user.is_empty()).then(|| strings.intern(user)),
-                ts: timestamp(ts.as_bytes()),
-                kind,
-                product: (!product.is_empty()).then(|| strings.intern(product)),
-                price: (kind == 2).then(|| price(price_raw.as_bytes())).flatten(),
-                ingest: timestamp(ingest.as_bytes()).unwrap_or(i64::MAX),
-            };
-            match events.entry(event_id.to_owned()) {
-                std::collections::hash_map::Entry::Vacant(e) => {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                if event.ingest < e.get().ingest {
                     e.insert(event);
                 }
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                    if event.ingest < e.get().ingest {
+            }
+        }
+    })?;
+    Ok((strings, events))
+}
+
+fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<Event>, String> {
+    let paths = csv_files(&data.join("events"))?;
+    let mut merged: FastMap<String, Event> = fast_map();
+    for batch in paths.chunks(ncpu) {
+        let parsed = batch
+            .par_iter()
+            .map(|path| parse_event_file(path))
+            .collect::<Result<Vec<_>, _>>()?;
+        for (local_strings, mut local_events) in parsed {
+            let remap = local_strings
+                .values
+                .iter()
+                .map(|value| strings.intern(value))
+                .collect::<Vec<_>>();
+            for (event_id, mut event) in local_events.drain() {
+                event.user = event.user.map(|id| remap[id as usize]);
+                event.product = event.product.map(|id| remap[id as usize]);
+                match merged.entry(event_id) {
+                    std::collections::hash_map::Entry::Vacant(e) => {
                         e.insert(event);
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        if event.ingest < e.get().ingest {
+                            e.insert(event);
+                        }
                     }
                 }
             }
-        })?;
+        }
     }
-    Ok(events.into_values().collect())
+    Ok(merged.into_values().collect())
 }
 
-fn parse_clicks(data: &Path, strings: &mut Interner) -> Result<Vec<Click>, String> {
+fn parse_click_file(path: &Path) -> Result<(Interner, Vec<Click>), String> {
+    let mut strings = Interner::default();
     let mut seen: FastSet<String> = fast_set();
     let mut clicks = Vec::new();
-    for path in csv_files(&data.join("clicks"))? {
-        each_row::<4, _>(&path, |row| {
-            let (Some(id), Some(user), Some(campaign), Some(ts)) =
-                (text(row[0]), text(row[1]), text(row[2]), text(row[3]))
-            else {
-                return;
-            };
-            if id.is_empty() || user.is_empty() || !seen.insert(id.to_owned()) {
-                return;
+    each_row::<4, _>(path, |row| {
+        let (Some(id), Some(user), Some(campaign), Some(ts)) =
+            (text(row[0]), text(row[1]), text(row[2]), text(row[3]))
+        else {
+            return;
+        };
+        if id.is_empty() || user.is_empty() || !seen.insert(id.to_owned()) {
+            return;
+        }
+        if let Some(ts) = timestamp(ts.as_bytes()) {
+            clicks.push(Click {
+                id: strings.intern(id),
+                user: strings.intern(user),
+                ts,
+                campaign: strings.intern(campaign),
+            });
+        }
+    })?;
+    Ok((strings, clicks))
+}
+
+fn parse_clicks(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<Click>, String> {
+    let paths = csv_files(&data.join("clicks"))?;
+    let mut seen: FastSet<Id> = fast_set();
+    let mut clicks = Vec::new();
+    for batch in paths.chunks(ncpu) {
+        let parsed = batch
+            .par_iter()
+            .map(|path| parse_click_file(path))
+            .collect::<Result<Vec<_>, _>>()?;
+        for (local_strings, local_clicks) in parsed {
+            let remap = local_strings
+                .values
+                .iter()
+                .map(|value| strings.intern(value))
+                .collect::<Vec<_>>();
+            for mut click in local_clicks {
+                click.id = remap[click.id as usize];
+                click.user = remap[click.user as usize];
+                click.campaign = remap[click.campaign as usize];
+                if seen.insert(click.id) {
+                    clicks.push(click);
+                }
             }
-            if let Some(ts) = timestamp(ts.as_bytes()) {
-                clicks.push(Click {
-                    id: strings.intern(id),
-                    user: strings.intern(user),
-                    ts,
-                    campaign: strings.intern(campaign),
-                });
-            }
-        })?;
+        }
     }
     Ok(clicks)
 }
@@ -443,6 +523,7 @@ fn write_table(
 }
 
 fn run() -> Result<(), String> {
+    let overall = Instant::now();
     let ncpu = env::var("NCPU")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -474,17 +555,33 @@ fn run() -> Result<(), String> {
     .ok_or("invalid window_end")?;
 
     let mut strings = Interner::default();
+    let phase = Instant::now();
     let links = parse_links(&data, &mut strings)?;
     let unknown = strings.intern("unknown");
     let organic = strings.intern("organic");
     let products = parse_products(&data, &mut strings)?;
     let campaigns = parse_campaigns(&data, &mut strings)?;
-    let events = parse_events(&data, &mut strings)?;
-    let mut clicks = parse_clicks(&data, &mut strings)?;
+    eprintln!(
+        "loaded reference files in {:.3}s",
+        phase.elapsed().as_secs_f64()
+    );
+    let phase = Instant::now();
+    let events = parse_events(&data, &mut strings, ncpu)?;
+    eprintln!(
+        "parsed and deduplicated events in {:.3}s",
+        phase.elapsed().as_secs_f64()
+    );
+    let phase = Instant::now();
+    let mut clicks = parse_clicks(&data, &mut strings, ncpu)?;
+    eprintln!(
+        "parsed and deduplicated clicks in {:.3}s",
+        phase.elapsed().as_secs_f64()
+    );
     let mut dsu = Dsu::new(strings.values.len());
     for (a, b) in links {
         dsu.union(a, b, &strings);
     }
+    let phase = Instant::now();
 
     let mut surviving = Vec::with_capacity(events.len());
     for mut e in events {
@@ -513,9 +610,19 @@ fn run() -> Result<(), String> {
         }
     }
     clicks.retain(|c| c.ts != i64::MIN);
+    eprintln!(
+        "linked IDs and filtered records in {:.3}s",
+        phase.elapsed().as_secs_f64()
+    );
 
+    let phase = Instant::now();
     surviving.par_sort_unstable_by_key(|e| (e.user.unwrap(), e.ts.unwrap()));
     clicks.par_sort_unstable_by_key(|c| (c.user, c.ts));
+    eprintln!(
+        "sorted events and clicks in {:.3}s",
+        phase.elapsed().as_secs_f64()
+    );
+    let phase = Instant::now();
     let mut users: FastMap<(Id, i32), UserAgg> = fast_map();
     let mut sessions = Vec::new();
     let mut i = 0;
@@ -573,6 +680,11 @@ fn run() -> Result<(), String> {
     }
 
     let mut click_rank: Vec<(Id, Id)> = clicks.iter().map(|c| (c.id, c.id)).collect();
+    eprintln!(
+        "sessionized and aggregated users in {:.3}s",
+        phase.elapsed().as_secs_f64()
+    );
+    let phase = Instant::now();
     click_rank
         .sort_unstable_by(|a, b| strings.get(a.0).as_bytes().cmp(strings.get(b.0).as_bytes()));
     let mut ranks = vec![0u32; strings.values.len()];
@@ -634,12 +746,49 @@ fn run() -> Result<(), String> {
         si = se;
     }
 
+    let user_totals = users
+        .values()
+        .fold((0i64, 0i64), |(sessions, revenue), row| {
+            (sessions + row.sessions, revenue + row.revenue)
+        });
+    let campaign_totals = campaign_daily.iter().fold(
+        (0i64, 0i64, 0i64, 0i64),
+        |(sessions, revenue, assists, nonorganic), ((campaign, _), row)| {
+            (
+                sessions + row.sessions,
+                revenue + row.revenue,
+                assists + row.assisted_sessions,
+                nonorganic
+                    + if *campaign == organic {
+                        0
+                    } else {
+                        row.sessions
+                    },
+            )
+        },
+    );
+    if user_totals.0 != sessions.len() as i64
+        || user_totals.1 != campaign_totals.1
+        || user_totals.0 != campaign_totals.0
+        || campaign_totals.2 < campaign_totals.3
+    {
+        return Err(format!(
+            "aggregate invariant failed: user={user_totals:?}, campaign={campaign_totals:?}, sessions={}",
+            sessions.len()
+        ));
+    }
+
     write_outputs(&out, &strings, &users, &campaign_daily, &campaigns)?;
     eprintln!(
-        "processed {} surviving events, {} sessions, {} clicks",
+        "attributed sessions and wrote tables in {:.3}s",
+        phase.elapsed().as_secs_f64()
+    );
+    eprintln!(
+        "processed {} surviving events, {} sessions, {} clicks in {:.3}s",
         surviving.len(),
         sessions.len(),
-        clicks.len()
+        clicks.len(),
+        overall.elapsed().as_secs_f64()
     );
     Ok(())
 }

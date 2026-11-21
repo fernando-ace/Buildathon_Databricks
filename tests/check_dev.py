@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 
 import polars as pl
+from runner import command
 
 TABLES = {
     "user_daily": {
@@ -44,13 +45,21 @@ def main() -> int:
     parser.add_argument("--binary", default=default_binary)
     parser.add_argument("--data", default="dev")
     parser.add_argument("--answer", default="tests/dev-answer")
+    parser.add_argument("--docker-image")
     args = parser.parse_args()
     binary, data, answer = Path(args.binary).resolve(), Path(args.data).resolve(), Path(args.answer)
     with tempfile.TemporaryDirectory(prefix="shopping-sessions-dev-") as temp:
         output = Path(temp) / "out"
+        scratch = Path(temp) / "scratch"
         output.mkdir()
-        env = dict(os.environ, DATA_DIR=str(data), OUTPUT_DIR=str(output), SCRATCH_DIR=temp)
-        result = subprocess.run([binary], env=env, capture_output=True, text=True)
+        scratch.mkdir()
+        if args.docker_image:
+            cmd = command(binary, args.docker_image, data, output, scratch)
+            env = os.environ.copy()
+        else:
+            cmd = command(binary, None, data, output, scratch)
+            env = dict(os.environ, DATA_DIR=str(data), OUTPUT_DIR=str(output), SCRATCH_DIR=str(scratch))
+        result = subprocess.run(cmd, env=env, capture_output=True, text=True)
         if result.returncode:
             print(result.stderr)
             return result.returncode
