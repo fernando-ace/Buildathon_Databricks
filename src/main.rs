@@ -170,9 +170,37 @@ const SESSION_GAP_MS: i64 = 1_800_000;
 const ATTRIBUTION_MS: i64 = 604_800_000;
 
 #[derive(Default)]
+struct StringArena {
+    chunks: Vec<Box<[u8]>>,
+    next: usize,
+}
+
+impl StringArena {
+    fn store(&mut self, bytes: &[u8]) -> StrRef {
+        const CHUNK_SIZE: usize = 64 * 1024;
+        if self
+            .chunks
+            .last()
+            .is_none_or(|chunk| chunk.len() - self.next < bytes.len())
+        {
+            self.chunks
+                .push(vec![0; CHUNK_SIZE.max(bytes.len())].into_boxed_slice());
+            self.next = 0;
+        }
+        let start = self.next;
+        let end = start + bytes.len();
+        let chunk = self.chunks.last_mut().unwrap();
+        chunk[start..end].copy_from_slice(bytes);
+        self.next = end;
+        StrRef::new(&chunk[start..end])
+    }
+}
+
+#[derive(Default)]
 struct Interner {
-    // StrRef keys point into these Box allocations, which stay stable as this Vec grows.
-    values: Vec<Box<str>>,
+    // Values point into fixed-size arena chunks, so their addresses stay stable.
+    values: Vec<StrRef>,
+    arena: StringArena,
     ids: FastMap<StrRef, Id>,
 }
 
@@ -182,16 +210,15 @@ impl Interner {
         if let Some(&id) = self.ids.get(&lookup) {
             return id;
         }
-        let text: Box<str> = text.into();
-        let key = StrRef::new(text.as_bytes());
+        let key = self.arena.store(text.as_bytes());
         let id = self.values.len() as Id;
-        self.values.push(text);
+        self.values.push(key);
         self.ids.insert(key, id);
         id
     }
 
     fn get(&self, id: Id) -> &str {
-        &self.values[id as usize]
+        text(self.values[id as usize].bytes()).unwrap()
     }
 }
 
