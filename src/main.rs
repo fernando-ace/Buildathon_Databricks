@@ -1088,8 +1088,8 @@ fn run() -> Result<(), String> {
     }
     let phase = Instant::now();
 
-    let mut surviving = Vec::with_capacity(events.len());
-    for mut e in events {
+    let mut surviving = events;
+    surviving.retain_mut(|e| {
         if e.user == MISSING_ID
             || e.ts == INVALID_EVENT_TS
             || e.ts < start
@@ -1098,14 +1098,14 @@ fn run() -> Result<(), String> {
             || e.kind > 2
             || (e.kind == 2 && e.price == INVALID_PRICE_CENTS)
         {
-            continue;
+            return false;
         }
         if (e.ingest as i128) - (e.ts as i128) > 86_400_000 {
-            continue;
+            return false;
         }
         e.user = dsu.canonical(e.user);
-        surviving.push(e);
-    }
+        true
+    });
     for c in &mut raw_clicks {
         if c.ts < start.saturating_sub(ATTRIBUTION_MS)
             || c.ts >= end
