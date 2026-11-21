@@ -985,20 +985,25 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
                 (source, partitions)
             })
             .collect::<Vec<_>>();
-        let mut partitions = (0..ncpu).map(|_| Vec::new()).collect::<Vec<_>>();
-        let mut source_buffers = Vec::with_capacity(file_partitions.len());
-        for (source, mut file_partition) in file_partitions {
+        let file_count = file_partitions.len();
+        let mut partitions = (0..ncpu)
+            .map(|_| Vec::with_capacity(file_count))
+            .collect::<Vec<_>>();
+        let mut source_buffers = Vec::with_capacity(file_count);
+        for (source, file_partition) in file_partitions {
             source_buffers.push(source);
-            for (partition, file_records) in partitions.iter_mut().zip(file_partition.iter_mut()) {
-                partition.append(file_records);
+            for (partition, file_records) in partitions.iter_mut().zip(file_partition) {
+                partition.push(file_records);
             }
         }
         shards
             .par_iter_mut()
             .zip(partitions.into_par_iter())
-            .for_each(|(shard, records)| {
-                for (hash, event_id, event) in records {
-                    shard.insert(hash, event_id, event);
+            .for_each(|(shard, file_records)| {
+                for records in file_records {
+                    for (hash, event_id, event) in records {
+                        shard.insert(hash, event_id, event);
+                    }
                 }
             });
         drop(source_buffers);
