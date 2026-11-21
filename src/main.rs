@@ -98,6 +98,10 @@ impl EventDeduper {
         let mut hasher = AHasher::default();
         id.hash(&mut hasher);
         let hash = hasher.finish();
+        self.insert_hashed(hash, id, event);
+    }
+
+    fn insert_hashed(&mut self, hash: u64, id: StrRef, event: Event) {
         match self
             .primary
             .raw_entry_mut()
@@ -129,14 +133,21 @@ impl EventDeduper {
         }
     }
 
-    fn into_records(self) -> Vec<(StrRef, Event)> {
+    fn into_records(self) -> Vec<(u64, StrRef, Event)> {
         let collision_count = self.collisions.values().map(Vec::len).sum::<usize>();
         let mut records = Vec::with_capacity(self.primary.len() + collision_count);
-        records.extend(self.primary.into_values().map(|record| record));
-        records.extend(self.collisions.into_values().flatten());
+        records.extend(
+            self.primary
+                .into_iter()
+                .map(|(hash, (id, event))| (hash, id, event)),
+        );
+        records.extend(self.collisions.into_iter().flat_map(|(hash, events)| {
+            events.into_iter().map(move |(id, event)| (hash, id, event))
+        }));
         records
     }
 }
+
 const DAY_MS: i64 = 86_400_000;
 const SESSION_GAP_MS: i64 = 1_800_000;
 const ATTRIBUTION_MS: i64 = 604_800_000;
@@ -161,6 +172,25 @@ impl Interner {
 
     fn get(&self, id: Id) -> &str {
         &self.values[id as usize]
+    }
+}
+
+#[derive(Default)]
+struct BorrowedInterner {
+    values: Vec<StrRef>,
+    ids: FastMap<StrRef, Id>,
+}
+
+impl BorrowedInterner {
+    fn intern(&mut self, bytes: &[u8]) -> Id {
+        let key = StrRef::new(bytes);
+        if let Some(&id) = self.ids.get(&key) {
+            return id;
+        }
+        let id = self.values.len() as Id;
+        self.values.push(key);
+        self.ids.insert(key, id);
+        id
     }
 }
 
@@ -436,6 +466,21 @@ where
     }
 }
 
+fn each_utf8_row_bytes<const N: usize, F>(bytes: &[u8], mut f: F)
+where
+    F: FnMut([&[u8]; N]),
+{
+    let mut lines = bytes.split(|b| *b == b'\n');
+    let _header = lines.next();
+    for line in lines {
+        if std::str::from_utf8(line).is_ok() {
+            if let Some(row) = fields::<N>(line) {
+                f(row);
+            }
+        }
+    }
+}
+
 fn each_row<const N: usize, F>(path: &Path, f: F) -> Result<(), String>
 where
     F: FnMut([&[u8]; N]),
@@ -479,49 +524,29 @@ fn parse_campaigns(data: &Path, strings: &mut Interner) -> Result<FastMap<Id, Id
     Ok(campaigns)
 }
 
-fn parse_event_file(path: &Path) -> Result<(Box<[u8]>, Interner, EventDeduper), String> {
+fn parse_event_file(path: &Path) -> Result<(Box<[u8]>, BorrowedInterner, EventDeduper), String> {
     let bytes = fs::read(path)
         .map_err(|e| format!("read {}: {e}", path.display()))?
         .into_boxed_slice();
-    let mut strings = Interner::default();
+    let mut strings = BorrowedInterner::default();
     let mut events = EventDeduper::new();
-    each_row_bytes::<7, _>(&bytes, |row| {
-        let (
-            Some(event_id),
-            Some(user),
-            Some(ts),
-            Some(ingest),
-            Some(kind),
-            Some(product),
-            Some(price_raw),
-        ) = (
-            text(row[0]),
-            text(row[1]),
-            text(row[2]),
-            text(row[3]),
-            text(row[4]),
-            text(row[5]),
-            text(row[6]),
-        )
-        else {
-            return;
-        };
-        if event_id.is_empty() {
+    each_utf8_row_bytes::<7, _>(&bytes, |row| {
+        if row[0].is_empty() {
             return;
         }
-        let kind = match kind.as_bytes() {
+        let kind = match row[4] {
             b"view" => 0,
             b"cart" => 1,
             b"purchase" => 2,
             _ => 255,
         };
         let event = Event {
-            user: (!user.is_empty()).then(|| strings.intern(user)),
-            ts: timestamp(ts.as_bytes()),
+            user: (!row[1].is_empty()).then(|| strings.intern(row[1])),
+            ts: timestamp(row[2]),
             kind,
-            product: (!product.is_empty()).then(|| strings.intern(product)),
-            price: (kind == 2).then(|| price(price_raw.as_bytes())).flatten(),
-            ingest: timestamp(ingest.as_bytes()).unwrap_or(i64::MAX),
+            product: (!row[5].is_empty()).then(|| strings.intern(row[5])),
+            price: (kind == 2).then(|| price(row[6])).flatten(),
+            ingest: timestamp(row[3]).unwrap_or(i64::MAX),
         };
         events.insert(StrRef::new(row[0]), event);
     });
@@ -530,31 +555,45 @@ fn parse_event_file(path: &Path) -> Result<(Box<[u8]>, Interner, EventDeduper), 
 
 fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<Event>, String> {
     let paths = csv_files(&data.join("events"))?;
-    let mut merged = EventDeduper::new();
+    let mut shards = (0..ncpu).map(|_| EventDeduper::new()).collect::<Vec<_>>();
     let mut source_buffers: Vec<Box<[u8]>> = Vec::with_capacity(paths.len());
     for batch in paths.chunks(ncpu) {
         let parsed = batch
             .par_iter()
             .map(|path| parse_event_file(path))
             .collect::<Result<Vec<_>, _>>()?;
+        let mut partitions = (0..ncpu).map(|_| Vec::new()).collect::<Vec<_>>();
         for (source, local_strings, local_events) in parsed {
             source_buffers.push(source);
             let remap = local_strings
                 .values
                 .iter()
-                .map(|value| strings.intern(value))
+                .map(|value| strings.intern(text(value.bytes()).unwrap()))
                 .collect::<Vec<_>>();
-            for (event_id, mut event) in local_events.into_records() {
-                event.user = event.user.map(|id| remap[id as usize]);
-                event.product = event.product.map(|id| remap[id as usize]);
-                merged.insert(event_id, event);
+            for (hash, event_id, event) in local_events.into_records() {
+                let event = Event {
+                    user: event.user.map(|id| remap[id as usize]),
+                    ts: event.ts,
+                    kind: event.kind,
+                    product: event.product.map(|id| remap[id as usize]),
+                    price: event.price,
+                    ingest: event.ingest,
+                };
+                partitions[hash as usize % ncpu].push((hash, event_id, event));
             }
         }
+        shards
+            .par_iter_mut()
+            .zip(partitions.into_par_iter())
+            .for_each(|(shard, records)| {
+                for (hash, event_id, event) in records {
+                    shard.insert_hashed(hash, event_id, event);
+                }
+            });
     }
-    let events = merged
-        .into_records()
+    let events = shards
         .into_iter()
-        .map(|(_, event)| event)
+        .flat_map(|shard| shard.into_records().into_iter().map(|(_, _, event)| event))
         .collect();
     drop(source_buffers);
     Ok(events)
