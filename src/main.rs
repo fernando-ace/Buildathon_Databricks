@@ -639,7 +639,37 @@ fn civil_days(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+#[derive(Default)]
+struct YearStartCache {
+    entries: [(i64, i64); 4],
+    len: usize,
+    next: usize,
+}
+
+impl YearStartCache {
+    fn get(&mut self, year: i64) -> i64 {
+        for &(cached_year, start) in &self.entries[..self.len] {
+            if cached_year == year {
+                return start;
+            }
+        }
+        let start = civil_days(year, 1, 1);
+        if self.len < self.entries.len() {
+            self.entries[self.len] = (year, start);
+            self.len += 1;
+        } else {
+            self.entries[self.next] = (year, start);
+            self.next = (self.next + 1) % self.entries.len();
+        }
+        start
+    }
+}
+
 fn timestamp(bytes: &[u8]) -> Option<i64> {
+    timestamp_with_cache(bytes, &mut YearStartCache::default())
+}
+
+fn timestamp_with_cache(bytes: &[u8], years: &mut YearStartCache) -> Option<i64> {
     if bytes.len() != 20 && bytes.len() != 25 || bytes.get(4) != Some(&b'-') {
         return ascii_u64(bytes).and_then(|n| i64::try_from(n).ok());
     }
@@ -687,7 +717,23 @@ fn timestamp(bytes: &[u8]) -> Option<i64> {
         let sign = if bytes[19] == b'+' { 1 } else { -1 };
         sign * (oh * 60 + om)
     };
-    let local = civil_days(year, month, day)
+    let month_start = match month {
+        1 => 0,
+        2 => 31,
+        3 => 59,
+        4 => 90,
+        5 => 120,
+        6 => 151,
+        7 => 181,
+        8 => 212,
+        9 => 243,
+        10 => 273,
+        11 => 304,
+        12 => 334,
+        _ => return None,
+    };
+    let day_of_year = month_start + i64::from(month > 2 && leap(year)) + day - 1;
+    let local = (years.get(year) + day_of_year)
         .checked_mul(86_400)?
         .checked_add(hour * 3_600 + minute * 60 + second)?;
     local.checked_sub(offset_minutes * 60)?.checked_mul(1_000)
@@ -778,6 +824,7 @@ fn parse_event_file(
         .into_boxed_slice();
     let mut strings = BorrowedInterner::with_capacity(bytes.len() / 152);
     let mut events = EventDeduper::with_capacity(bytes.len() / 76);
+    let mut years = YearStartCache::default();
     each_utf8_row_bytes::<7, _>(&bytes, |row| {
         if row[0].is_empty() {
             return;
@@ -790,7 +837,7 @@ fn parse_event_file(
         };
         let event = Event {
             user: (!row[1].is_empty()).then(|| strings.intern(row[1])),
-            ts: timestamp(row[2]),
+            ts: timestamp_with_cache(row[2], &mut years),
             kind,
             product: if row[5].is_empty() {
                 MISSING_ID
@@ -800,7 +847,7 @@ fn parse_event_file(
                 0
             },
             price: (kind == 2).then(|| price(row[6])).flatten(),
-            ingest: timestamp(row[3]).unwrap_or(i64::MAX),
+            ingest: timestamp_with_cache(row[3], &mut years).unwrap_or(i64::MAX),
             file_order,
         };
         events.insert(StrRef::new(row[0]), event);
@@ -887,6 +934,7 @@ fn parse_click_file(path: &Path) -> Result<(Box<[u8]>, BorrowedInterner, Vec<Raw
     let mut strings = BorrowedInterner::with_capacity(bytes.len() / 100);
     let mut seen: FastSet<StrRef> = fast_set_with_capacity(bytes.len() / 64);
     let mut clicks = Vec::new();
+    let mut years = YearStartCache::default();
     each_row_bytes::<4, _>(&bytes, |row| {
         let (Some(id), Some(user), Some(campaign), Some(ts)) =
             (text(row[0]), text(row[1]), text(row[2]), text(row[3]))
@@ -896,7 +944,7 @@ fn parse_click_file(path: &Path) -> Result<(Box<[u8]>, BorrowedInterner, Vec<Raw
         if id.is_empty() || user.is_empty() || !seen.insert(StrRef::new(row[0])) {
             return;
         }
-        if let Some(ts) = timestamp(ts.as_bytes()) {
+        if let Some(ts) = timestamp_with_cache(ts.as_bytes(), &mut years) {
             clicks.push(RawClick {
                 id: StrRef::new(row[0]),
                 user: strings.intern(user.as_bytes()),
