@@ -277,7 +277,7 @@ const _: () = assert!(std::mem::size_of::<Event>() == 32);
 
 #[derive(Clone, Copy)]
 struct Click {
-    id: Id,
+    id: StrRef,
     user: Id,
     ts: i64,
     campaign: Id,
@@ -395,7 +395,7 @@ fn attribute_user_sessions(
         while add < clicks.len() && clicks[add].ts <= session.start {
             let click = clicks[add];
             while active.back().is_some_and(|last| {
-                click.ts > last.ts || (click.ts == last.ts && click.id < last.id)
+                click.ts > last.ts || (click.ts == last.ts && click.id.bytes() < last.id.bytes())
             }) {
                 active.pop_back();
             }
@@ -1150,27 +1150,15 @@ fn run() -> Result<(), String> {
         phase.elapsed().as_secs_f64()
     );
     let phase = Instant::now();
-    let mut click_rank = raw_clicks
-        .iter()
-        .enumerate()
-        .map(|(index, click)| (click.id, index))
-        .collect::<Vec<_>>();
-    click_rank.sort_unstable_by(|a, b| a.0.bytes().cmp(b.0.bytes()));
-    let mut ranks = vec![0u32; raw_clicks.len()];
-    for (rank, (_, index)) in click_rank.into_iter().enumerate() {
-        ranks[index] = rank as u32;
-    }
     let clicks = raw_clicks
         .into_iter()
-        .zip(ranks)
-        .map(|(click, id)| Click {
-            id,
+        .map(|click| Click {
+            id: click.id,
             user: click.user,
             ts: click.ts,
             campaign: click.campaign,
         })
         .collect::<Vec<_>>();
-    drop(click_sources);
     let mut attribution_ranges = Vec::new();
     let mut si = 0usize;
     let mut ci = 0usize;
@@ -1210,6 +1198,7 @@ fn run() -> Result<(), String> {
             daily
         })
         .collect::<Vec<FastMap<(Id, i32), CampaignAgg>>>();
+    drop(click_sources);
     let mut campaign_daily: FastMap<(Id, i32), CampaignAgg> = fast_map();
     for partial in partial_campaigns {
         for (key, row) in partial {
