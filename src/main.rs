@@ -678,11 +678,7 @@ fn timestamp_with_cache(bytes: &[u8], years: &mut YearStartCache) -> Option<i64>
     if bytes.len() != 20 && bytes.len() != 25 || bytes.get(4) != Some(&b'-') {
         return ascii_u64(bytes).and_then(|n| i64::try_from(n).ok());
     }
-    if bytes.len() != 20 && bytes.len() != 25 {
-        return None;
-    }
-    if bytes[4] != b'-'
-        || bytes[7] != b'-'
+    if bytes[7] != b'-'
         || bytes[10] != b'T'
         || bytes[13] != b':'
         || bytes[16] != b':'
