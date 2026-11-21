@@ -8,6 +8,7 @@ rust-version = "1.88"
 ahash = "0.8"
 arrow-array = "60.1.0"
 arrow-schema = "60.1.0"
+hashbrown = "0.17.1"
 memchr = "2.7"
 parquet = { version = "60.1.0", default-features = false, features = ["arrow", "zstd"] }
 rayon = "1.11"

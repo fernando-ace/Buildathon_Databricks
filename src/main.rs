@@ -1,4 +1,4 @@
-use ahash::RandomState;
+use ahash::{AHasher, RandomState};
 use arrow_array::{ArrayRef, Date32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use memchr::memchr_iter;
@@ -10,7 +10,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,6 +19,7 @@ use std::time::Instant;
 type Id = u32;
 type FastMap<K, V> = HashMap<K, V, RandomState>;
 type FastSet<K> = HashSet<K, RandomState>;
+type EventMap = hashbrown::HashMap<u64, (StrRef, Event), BuildHasherDefault<IdentityHasher>>;
 
 #[derive(Clone, Copy)]
 struct StrRef {
@@ -56,6 +57,84 @@ impl Eq for StrRef {}
 impl Hash for StrRef {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.bytes().hash(state);
+    }
+}
+
+#[derive(Default)]
+struct IdentityHasher(u64);
+
+impl Hasher for IdentityHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for &byte in bytes {
+            hash = (hash ^ byte as u64).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        self.0 = hash;
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+}
+
+struct EventDeduper {
+    primary: EventMap,
+    collisions: FastMap<u64, Vec<(StrRef, Event)>>,
+}
+
+impl EventDeduper {
+    fn new() -> Self {
+        Self {
+            primary: EventMap::default(),
+            collisions: fast_map(),
+        }
+    }
+
+    fn insert(&mut self, id: StrRef, event: Event) {
+        let mut hasher = AHasher::default();
+        id.hash(&mut hasher);
+        let hash = hasher.finish();
+        match self
+            .primary
+            .raw_entry_mut()
+            .from_hash(hash, |stored_hash| *stored_hash == hash)
+        {
+            hashbrown::hash_map::RawEntryMut::Vacant(entry) => {
+                entry.insert_hashed_nocheck(hash, hash, (id, event));
+            }
+            hashbrown::hash_map::RawEntryMut::Occupied(mut entry) => {
+                let (stored_id, stored_event) = entry.get_mut();
+                if *stored_id == id {
+                    if event.ingest < stored_event.ingest {
+                        *stored_event = event;
+                    }
+                    return;
+                }
+                let collisions = self.collisions.entry(hash).or_default();
+                if let Some((_, stored_event)) = collisions
+                    .iter_mut()
+                    .find(|(candidate, _)| *candidate == id)
+                {
+                    if event.ingest < stored_event.ingest {
+                        *stored_event = event;
+                    }
+                } else {
+                    collisions.push((id, event));
+                }
+            }
+        }
+    }
+
+    fn into_records(self) -> Vec<(StrRef, Event)> {
+        let collision_count = self.collisions.values().map(Vec::len).sum::<usize>();
+        let mut records = Vec::with_capacity(self.primary.len() + collision_count);
+        records.extend(self.primary.into_values().map(|record| record));
+        records.extend(self.collisions.into_values().flatten());
+        records
     }
 }
 const DAY_MS: i64 = 86_400_000;
@@ -234,12 +313,17 @@ fn text(bytes: &[u8]) -> Option<&str> {
 }
 
 fn ascii_u64(bytes: &[u8]) -> Option<u64> {
-    if bytes.is_empty() || bytes.iter().any(|b| !b.is_ascii_digit()) {
+    if bytes.is_empty() {
         return None;
     }
-    bytes.iter().try_fold(0u64, |n, b| {
-        n.checked_mul(10)?.checked_add((b - b'0') as u64)
-    })
+    let mut value = 0u64;
+    for &byte in bytes {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add((byte - b'0') as u64)?;
+    }
+    Some(value)
 }
 
 #[inline]
@@ -281,7 +365,7 @@ fn civil_days(y: i64, m: i64, d: i64) -> i64 {
 }
 
 fn timestamp(bytes: &[u8]) -> Option<i64> {
-    if bytes.iter().all(u8::is_ascii_digit) {
+    if bytes.len() != 20 && bytes.len() != 25 || bytes.get(4) != Some(&b'-') {
         return ascii_u64(bytes).and_then(|n| i64::try_from(n).ok());
     }
     if bytes.len() != 20 && bytes.len() != 25 {
@@ -395,12 +479,12 @@ fn parse_campaigns(data: &Path, strings: &mut Interner) -> Result<FastMap<Id, Id
     Ok(campaigns)
 }
 
-fn parse_event_file(path: &Path) -> Result<(Box<[u8]>, Interner, FastMap<StrRef, Event>), String> {
+fn parse_event_file(path: &Path) -> Result<(Box<[u8]>, Interner, EventDeduper), String> {
     let bytes = fs::read(path)
         .map_err(|e| format!("read {}: {e}", path.display()))?
         .into_boxed_slice();
     let mut strings = Interner::default();
-    let mut events: FastMap<StrRef, Event> = fast_map();
+    let mut events = EventDeduper::new();
     each_row_bytes::<7, _>(&bytes, |row| {
         let (
             Some(event_id),
@@ -439,53 +523,39 @@ fn parse_event_file(path: &Path) -> Result<(Box<[u8]>, Interner, FastMap<StrRef,
             price: (kind == 2).then(|| price(price_raw.as_bytes())).flatten(),
             ingest: timestamp(ingest.as_bytes()).unwrap_or(i64::MAX),
         };
-        match events.entry(StrRef::new(row[0])) {
-            std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert(event);
-            }
-            std::collections::hash_map::Entry::Occupied(mut e) => {
-                if event.ingest < e.get().ingest {
-                    e.insert(event);
-                }
-            }
-        }
+        events.insert(StrRef::new(row[0]), event);
     });
     Ok((bytes, strings, events))
 }
 
 fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<Event>, String> {
     let paths = csv_files(&data.join("events"))?;
-    let mut merged: FastMap<StrRef, Event> = fast_map();
+    let mut merged = EventDeduper::new();
     let mut source_buffers: Vec<Box<[u8]>> = Vec::with_capacity(paths.len());
     for batch in paths.chunks(ncpu) {
         let parsed = batch
             .par_iter()
             .map(|path| parse_event_file(path))
             .collect::<Result<Vec<_>, _>>()?;
-        for (source, local_strings, mut local_events) in parsed {
+        for (source, local_strings, local_events) in parsed {
             source_buffers.push(source);
             let remap = local_strings
                 .values
                 .iter()
                 .map(|value| strings.intern(value))
                 .collect::<Vec<_>>();
-            for (event_id, mut event) in local_events.drain() {
+            for (event_id, mut event) in local_events.into_records() {
                 event.user = event.user.map(|id| remap[id as usize]);
                 event.product = event.product.map(|id| remap[id as usize]);
-                match merged.entry(event_id) {
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        e.insert(event);
-                    }
-                    std::collections::hash_map::Entry::Occupied(mut e) => {
-                        if event.ingest < e.get().ingest {
-                            e.insert(event);
-                        }
-                    }
-                }
+                merged.insert(event_id, event);
             }
         }
     }
-    let events = merged.into_values().collect();
+    let events = merged
+        .into_records()
+        .into_iter()
+        .map(|(_, event)| event)
+        .collect();
     drop(source_buffers);
     Ok(events)
 }
