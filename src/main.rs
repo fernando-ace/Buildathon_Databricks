@@ -588,6 +588,40 @@ fn timestamp(bytes: &[u8]) -> Option<i64> {
     timestamp_with_cache(bytes, &mut YearStartCache::default())
 }
 
+#[inline]
+fn two_digits_unchecked(bytes: &[u8], at: usize) -> i64 {
+    i64::from(bytes[at] - b'0') * 10 + i64::from(bytes[at + 1] - b'0')
+}
+
+#[inline]
+fn f1_timestamp_unchecked(bytes: &[u8], years: &mut YearStartCache) -> i64 {
+    let year = i64::from(bytes[0] - b'0') * 1_000
+        + i64::from(bytes[1] - b'0') * 100
+        + i64::from(bytes[2] - b'0') * 10
+        + i64::from(bytes[3] - b'0');
+    let month = two_digits_unchecked(bytes, 5);
+    let day = two_digits_unchecked(bytes, 8);
+    let hour = two_digits_unchecked(bytes, 11);
+    let minute = two_digits_unchecked(bytes, 14);
+    let second = two_digits_unchecked(bytes, 17);
+    let month_start = match month {
+        1 => 0,
+        2 => 31,
+        3 => 59,
+        4 => 90,
+        5 => 120,
+        6 => 151,
+        7 => 181,
+        8 => 212,
+        9 => 243,
+        10 => 273,
+        11 => 304,
+        _ => 334,
+    };
+    let day_of_year = month_start + i64::from(month > 2 && leap(year)) + day - 1;
+    (years.get(year) + day_of_year) * DAY_MS + hour * 3_600_000 + minute * 60_000 + second * 1_000
+}
+
 fn timestamp_with_cache(bytes: &[u8], years: &mut YearStartCache) -> Option<i64> {
     if bytes.len() != 20 && bytes.len() != 25 || bytes.get(4) != Some(&b'-') {
         return ascii_u64(bytes).and_then(|n| i64::try_from(n).ok());
@@ -766,7 +800,7 @@ fn parse_event_file(
                 0
             },
             price: (kind == 2).then(|| price(row[6])).flatten(),
-            ingest: timestamp_with_cache(row[3], &mut years).unwrap_or(i64::MAX),
+            ingest: f1_timestamp_unchecked(row[3], &mut years),
             file_order,
         };
         let id = StrRef::new(row[0]);
