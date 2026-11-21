@@ -1,7 +1,7 @@
 use ahash::{AHasher, RandomState};
 use arrow_array::{ArrayRef, Date32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use memchr::memchr_iter;
+use memchr::{memchr, memchr2};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -121,7 +121,9 @@ impl EventShard {
                 let (stored_id, stored_event) = entry.get_mut();
                 let stored = &self.ids[stored_id.start..stored_id.start + stored_id.len];
                 if stored == id.bytes() {
-                    if event.ingest < stored_event.ingest {
+                    if (event.ingest, event.file_order)
+                        < (stored_event.ingest, stored_event.file_order)
+                    {
                         *stored_event = event;
                     }
                     return;
@@ -131,7 +133,9 @@ impl EventShard {
                     .iter_mut()
                     .find(|(key, _)| &self.ids[key.start..key.start + key.len] == id.bytes())
                 {
-                    if event.ingest < stored_event.ingest {
+                    if (event.ingest, event.file_order)
+                        < (stored_event.ingest, stored_event.file_order)
+                    {
                         *stored_event = event;
                     }
                 } else {
@@ -190,7 +194,9 @@ impl EventDeduper {
             hashbrown::hash_map::RawEntryMut::Occupied(mut entry) => {
                 let (stored_id, stored_event) = entry.get_mut();
                 if *stored_id == id {
-                    if event.ingest < stored_event.ingest {
+                    if (event.ingest, event.file_order)
+                        < (stored_event.ingest, stored_event.file_order)
+                    {
                         *stored_event = event;
                     }
                     return;
@@ -200,7 +206,9 @@ impl EventDeduper {
                     .iter_mut()
                     .find(|(candidate, _)| *candidate == id)
                 {
-                    if event.ingest < stored_event.ingest {
+                    if (event.ingest, event.file_order)
+                        < (stored_event.ingest, stored_event.file_order)
+                    {
                         *stored_event = event;
                     }
                 } else {
@@ -336,6 +344,7 @@ struct Event {
     product: Option<Id>,
     price: Option<i64>,
     ingest: i64,
+    file_order: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -403,29 +412,41 @@ fn fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
         return None;
     }
     let mut out: [&[u8]; N] = [&[]; N];
-    let mut count = 0usize;
     let mut start = 0;
-    for end in memchr_iter(b',', line).chain(std::iter::once(line.len())) {
-        let raw = &line[start..end];
-        let field = if raw.first() == Some(&b'"') {
-            if raw.len() < 2 || raw.last() != Some(&b'"') || raw[1..raw.len() - 1].contains(&b'"') {
+    for (index, slot) in out.iter_mut().enumerate() {
+        if line.get(start) == Some(&b'"') {
+            let close = start + 1 + memchr(b'"', &line[start + 1..])?;
+            let next = close + 1;
+            *slot = &line[start + 1..close];
+            if index + 1 == N {
+                if next != line.len() {
+                    return None;
+                }
+            } else if line.get(next) != Some(&b',') {
                 return None;
+            } else {
+                start = next + 1;
             }
-            &raw[1..raw.len() - 1]
         } else {
-            if raw.contains(&b'"') {
+            let tail = &line[start..];
+            let end = match memchr2(b',', b'"', tail) {
+                Some(offset) if tail[offset] == b',' => start + offset,
+                Some(_) => return None,
+                None => line.len(),
+            };
+            *slot = &line[start..end];
+            if index + 1 == N {
+                if end != line.len() {
+                    return None;
+                }
+            } else if end == line.len() {
                 return None;
+            } else {
+                start = end + 1;
             }
-            raw
-        };
-        if count == N {
-            return None;
         }
-        out[count] = field;
-        count += 1;
-        start = end + 1;
     }
-    (count == N).then_some(out)
+    Some(out)
 }
 
 fn text(bytes: &[u8]) -> Option<&str> {
@@ -614,7 +635,10 @@ fn parse_campaigns(data: &Path, strings: &mut Interner) -> Result<FastMap<Id, Id
     Ok(campaigns)
 }
 
-fn parse_event_file(path: &Path) -> Result<(Box<[u8]>, BorrowedInterner, EventDeduper), String> {
+fn parse_event_file(
+    path: &Path,
+    file_order: u32,
+) -> Result<(Box<[u8]>, BorrowedInterner, EventDeduper), String> {
     let bytes = fs::read(path)
         .map_err(|e| format!("read {}: {e}", path.display()))?
         .into_boxed_slice();
@@ -637,6 +661,7 @@ fn parse_event_file(path: &Path) -> Result<(Box<[u8]>, BorrowedInterner, EventDe
             product: (!row[5].is_empty()).then(|| strings.intern(row[5])),
             price: (kind == 2).then(|| price(row[6])).flatten(),
             ingest: timestamp(row[3]).unwrap_or(i64::MAX),
+            file_order,
         };
         events.insert(StrRef::new(row[0]), event);
     });
@@ -645,11 +670,39 @@ fn parse_event_file(path: &Path) -> Result<(Box<[u8]>, BorrowedInterner, EventDe
 
 fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<Event>, String> {
     let paths = csv_files(&data.join("events"))?;
+    let mut sized_paths = paths
+        .into_iter()
+        .enumerate()
+        .map(|(order, path)| {
+            let size = fs::metadata(&path)
+                .map_err(|error| format!("stat {}: {error}", path.display()))?
+                .len();
+            Ok((order as u32, path, size))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    sized_paths.sort_unstable_by_key(|(_, _, size)| Reverse(*size));
+    let mut buckets = (0..ncpu).map(|_| Vec::new()).collect::<Vec<_>>();
+    let mut bucket_bytes = vec![0u64; ncpu];
+    for (order, path, size) in sized_paths {
+        let bucket = bucket_bytes
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, total)| *total)
+            .map(|(index, _)| index)
+            .unwrap();
+        bucket_bytes[bucket] += size;
+        buckets[bucket].push((order, path));
+    }
     let mut shards = (0..ncpu).map(|_| EventShard::new()).collect::<Vec<_>>();
-    for batch in paths.chunks(ncpu) {
+    let batch_count = buckets.iter().map(Vec::len).max().unwrap_or(0);
+    for batch_index in 0..batch_count {
+        let batch = buckets
+            .iter()
+            .filter_map(|bucket| bucket.get(batch_index))
+            .collect::<Vec<_>>();
         let parsed = batch
             .par_iter()
-            .map(|path| parse_event_file(path))
+            .map(|(order, path)| parse_event_file(path, *order))
             .collect::<Result<Vec<_>, _>>()?;
         let mut source_buffers = Vec::with_capacity(parsed.len());
         let mut partitions = (0..ncpu).map(|_| Vec::new()).collect::<Vec<_>>();
