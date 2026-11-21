@@ -19,7 +19,8 @@ use std::time::Instant;
 type Id = u32;
 type FastMap<K, V> = HashMap<K, V, RandomState>;
 type FastSet<K> = HashSet<K, RandomState>;
-type EventMap = hashbrown::HashMap<u64, (StrRef, Event), BuildHasherDefault<IdentityHasher>>;
+type LocalEventMap = hashbrown::HashMap<u64, (StrRef, Event), BuildHasherDefault<IdentityHasher>>;
+type ShardEventMap = hashbrown::HashMap<u64, (IdRef, Event), BuildHasherDefault<IdentityHasher>>;
 
 #[derive(Clone, Copy)]
 struct StrRef {
@@ -59,6 +60,12 @@ impl Hash for StrRef {
     }
 }
 
+#[derive(Clone, Copy)]
+struct IdRef {
+    start: usize,
+    len: usize,
+}
+
 #[derive(Default)]
 struct IdentityHasher(u64);
 
@@ -81,14 +88,85 @@ impl Hasher for IdentityHasher {
 }
 
 struct EventDeduper {
-    primary: EventMap,
+    primary: LocalEventMap,
     collisions: FastMap<u64, Vec<(StrRef, Event)>>,
+}
+
+struct EventShard {
+    primary: ShardEventMap,
+    collisions: FastMap<u64, Vec<(IdRef, Event)>>,
+    ids: Vec<u8>,
+}
+
+impl EventShard {
+    fn new() -> Self {
+        Self {
+            primary: ShardEventMap::default(),
+            collisions: fast_map(),
+            ids: Vec::new(),
+        }
+    }
+
+    fn insert(&mut self, hash: u64, id: StrRef, event: Event) {
+        match self
+            .primary
+            .raw_entry_mut()
+            .from_hash(hash, |stored_hash| *stored_hash == hash)
+        {
+            hashbrown::hash_map::RawEntryMut::Vacant(entry) => {
+                let key = Self::store(&mut self.ids, id);
+                entry.insert_hashed_nocheck(hash, hash, (key, event));
+            }
+            hashbrown::hash_map::RawEntryMut::Occupied(mut entry) => {
+                let (stored_id, stored_event) = entry.get_mut();
+                let stored = &self.ids[stored_id.start..stored_id.start + stored_id.len];
+                if stored == id.bytes() {
+                    if event.ingest < stored_event.ingest {
+                        *stored_event = event;
+                    }
+                    return;
+                }
+                let collisions = self.collisions.entry(hash).or_default();
+                if let Some((_, stored_event)) = collisions
+                    .iter_mut()
+                    .find(|(key, _)| &self.ids[key.start..key.start + key.len] == id.bytes())
+                {
+                    if event.ingest < stored_event.ingest {
+                        *stored_event = event;
+                    }
+                } else {
+                    let key = Self::store(&mut self.ids, id);
+                    collisions.push((key, event));
+                }
+            }
+        }
+    }
+
+    fn store(ids: &mut Vec<u8>, id: StrRef) -> IdRef {
+        let start = ids.len();
+        let bytes = id.bytes();
+        ids.extend_from_slice(bytes);
+        IdRef {
+            start,
+            len: bytes.len(),
+        }
+    }
+
+    fn append_events(self, events: &mut Vec<Event>) {
+        events.extend(self.primary.into_values().map(|(_, event)| event));
+        events.extend(
+            self.collisions
+                .into_values()
+                .flatten()
+                .map(|(_, event)| event),
+        );
+    }
 }
 
 impl EventDeduper {
     fn new() -> Self {
         Self {
-            primary: EventMap::default(),
+            primary: LocalEventMap::default(),
             collisions: fast_map(),
         }
     }
@@ -567,13 +645,13 @@ fn parse_event_file(path: &Path) -> Result<(Box<[u8]>, BorrowedInterner, EventDe
 
 fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<Event>, String> {
     let paths = csv_files(&data.join("events"))?;
-    let mut shards = (0..ncpu).map(|_| EventDeduper::new()).collect::<Vec<_>>();
-    let mut source_buffers: Vec<Box<[u8]>> = Vec::with_capacity(paths.len());
+    let mut shards = (0..ncpu).map(|_| EventShard::new()).collect::<Vec<_>>();
     for batch in paths.chunks(ncpu) {
         let parsed = batch
             .par_iter()
             .map(|path| parse_event_file(path))
             .collect::<Result<Vec<_>, _>>()?;
+        let mut source_buffers = Vec::with_capacity(parsed.len());
         let mut partitions = (0..ncpu).map(|_| Vec::new()).collect::<Vec<_>>();
         for (source, local_strings, local_events) in parsed {
             source_buffers.push(source);
@@ -589,9 +667,10 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
             .zip(partitions.into_par_iter())
             .for_each(|(shard, records)| {
                 for (hash, event_id, event) in records {
-                    shard.insert_hashed(hash, event_id, event);
+                    shard.insert(hash, event_id, event);
                 }
             });
+        drop(source_buffers);
     }
     let total_events = shards
         .iter()
@@ -599,16 +678,8 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
         .sum();
     let mut events = Vec::with_capacity(total_events);
     for shard in shards {
-        events.extend(shard.primary.into_values().map(|(_, event)| event));
-        events.extend(
-            shard
-                .collisions
-                .into_values()
-                .flatten()
-                .map(|(_, event)| event),
-        );
+        shard.append_events(&mut events);
     }
-    drop(source_buffers);
     Ok(events)
 }
 
