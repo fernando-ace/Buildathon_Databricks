@@ -1309,33 +1309,14 @@ fn write_outputs(
         top_category.push(top);
     }
     let user_path = output_dir(out, "user_daily")?;
-    write_table(
-        &user_path,
-        &[
-            "user_id",
-            "day",
-            "sessions",
-            "events",
-            "revenue_cents",
-            "top_category",
-        ],
-        &[
-            DataType::Utf8,
-            DataType::Date32,
-            DataType::Int64,
-            DataType::Int64,
-            DataType::Int64,
-            DataType::Utf8,
-        ],
-        vec![
-            Arc::new(StringArray::from(user_ids)),
-            Arc::new(Date32Array::from(user_days)),
-            Arc::new(Int64Array::from(user_sessions)),
-            Arc::new(Int64Array::from(user_events)),
-            Arc::new(Int64Array::from(user_revenue)),
-            Arc::new(StringArray::from(top_category)),
-        ],
-    )?;
+    let user_arrays: Vec<ArrayRef> = vec![
+        Arc::new(StringArray::from(user_ids)),
+        Arc::new(Date32Array::from(user_days)),
+        Arc::new(Int64Array::from(user_sessions)),
+        Arc::new(Int64Array::from(user_events)),
+        Arc::new(Int64Array::from(user_revenue)),
+        Arc::new(StringArray::from(top_category)),
+    ];
 
     let mut campaign_rows = campaigns_daily.iter().collect::<Vec<_>>();
     campaign_rows.sort_unstable_by_key(|((campaign, d), _)| (*campaign, *d));
@@ -1364,36 +1345,66 @@ fn write_outputs(
         assists.push(agg.assisted_sessions);
     }
     let campaign_path = output_dir(out, "campaign_daily")?;
-    write_table(
-        &campaign_path,
-        &[
-            "campaign_id",
-            "channel",
-            "day",
-            "sessions",
-            "purchasing_sessions",
-            "revenue_cents",
-            "assisted_sessions",
-        ],
-        &[
-            DataType::Utf8,
-            DataType::Utf8,
-            DataType::Date32,
-            DataType::Int64,
-            DataType::Int64,
-            DataType::Int64,
-            DataType::Int64,
-        ],
-        vec![
-            Arc::new(StringArray::from(campaign_ids)),
-            Arc::new(StringArray::from(channels_out)),
-            Arc::new(Date32Array::from(campaign_days)),
-            Arc::new(Int64Array::from(campaign_sessions)),
-            Arc::new(Int64Array::from(purchasing)),
-            Arc::new(Int64Array::from(revenue)),
-            Arc::new(Int64Array::from(assists)),
-        ],
-    )?;
+    let campaign_arrays: Vec<ArrayRef> = vec![
+        Arc::new(StringArray::from(campaign_ids)),
+        Arc::new(StringArray::from(channels_out)),
+        Arc::new(Date32Array::from(campaign_days)),
+        Arc::new(Int64Array::from(campaign_sessions)),
+        Arc::new(Int64Array::from(purchasing)),
+        Arc::new(Int64Array::from(revenue)),
+        Arc::new(Int64Array::from(assists)),
+    ];
+
+    let (user_result, campaign_result) = rayon::join(
+        || {
+            write_table(
+                &user_path,
+                &[
+                    "user_id",
+                    "day",
+                    "sessions",
+                    "events",
+                    "revenue_cents",
+                    "top_category",
+                ],
+                &[
+                    DataType::Utf8,
+                    DataType::Date32,
+                    DataType::Int64,
+                    DataType::Int64,
+                    DataType::Int64,
+                    DataType::Utf8,
+                ],
+                user_arrays,
+            )
+        },
+        || {
+            write_table(
+                &campaign_path,
+                &[
+                    "campaign_id",
+                    "channel",
+                    "day",
+                    "sessions",
+                    "purchasing_sessions",
+                    "revenue_cents",
+                    "assisted_sessions",
+                ],
+                &[
+                    DataType::Utf8,
+                    DataType::Utf8,
+                    DataType::Date32,
+                    DataType::Int64,
+                    DataType::Int64,
+                    DataType::Int64,
+                    DataType::Int64,
+                ],
+                campaign_arrays,
+            )
+        },
+    );
+    user_result?;
+    campaign_result?;
     Ok(())
 }
 
