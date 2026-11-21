@@ -2,19 +2,16 @@ FROM rust:1.100-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock* ./
 COPY src ./src
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+crt-static"
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked \
-    && cp /src/target/release/shopping-sessions /shopping-sessions
+    cargo build --release --locked --target x86_64-unknown-linux-gnu \
+    && cp /src/target/x86_64-unknown-linux-gnu/release/shopping-sessions /shopping-sessions
 
-FROM debian:bookworm-slim
-RUN useradd --uid 1000 --no-create-home --home-dir /scratch app \
-    && mkdir -p /app /scratch \
-    && chown 1000:1000 /scratch
-COPY --from=build /shopping-sessions /app/shopping-sessions
+FROM scratch
+COPY --from=build /shopping-sessions /shopping-sessions
 USER 1000:1000
-WORKDIR /app
 ENV DATA_DIR=/data OUTPUT_DIR=/output SCRATCH_DIR=/scratch HOME=/scratch
-ENTRYPOINT ["/app/shopping-sessions"]
+ENTRYPOINT ["/shopping-sessions"]
 
