@@ -982,7 +982,7 @@ fn parse_clicks(
     let mut seen = (0..ncpu).map(|_| fast_set()).collect::<Vec<_>>();
     let mut source_buffers = Vec::with_capacity(paths.len());
     let mut clicks = Vec::new();
-    for batch in paths.chunks(ncpu) {
+    for batch in paths.chunks(paths.len().max(1)) {
         let parsed = batch
             .par_iter()
             .map(|path| parse_click_file(path))
