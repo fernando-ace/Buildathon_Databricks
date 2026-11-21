@@ -23,6 +23,7 @@ const INVALID_PRICE_CENTS: u32 = 0;
 const INVALID_EVENT_KIND: u8 = u8::MAX;
 type FastMap<K, V> = HashMap<K, V, RandomState>;
 type FastSet<K> = HashSet<K, RandomState>;
+type PackedUserMap = hashbrown::HashMap<u64, Id, BuildHasherDefault<IdentityHasher>>;
 type ShardEventMap = hashbrown::HashMap<u64, (IdRef, Event), BuildHasherDefault<IdentityHasher>>;
 
 #[derive(Clone, Copy)]
@@ -226,6 +227,7 @@ impl Interner {
 struct BorrowedInterner {
     values: Vec<StrRef>,
     ids: FastMap<StrRef, Id>,
+    users: PackedUserMap,
 }
 
 impl BorrowedInterner {
@@ -233,6 +235,7 @@ impl BorrowedInterner {
         Self {
             values: Vec::with_capacity(capacity),
             ids: fast_map_with_capacity(capacity),
+            users: PackedUserMap::with_capacity_and_hasher(capacity, BuildHasherDefault::default()),
         }
     }
 
@@ -244,6 +247,19 @@ impl BorrowedInterner {
         let id = self.values.len() as Id;
         self.values.push(key);
         self.ids.insert(key, id);
+        id
+    }
+
+    fn intern_user(&mut self, bytes: &[u8]) -> Id {
+        let Some(key) = packed_user_id(bytes) else {
+            return self.intern(bytes);
+        };
+        if let Some(&id) = self.users.get(&key) {
+            return id;
+        }
+        let id = self.values.len() as Id;
+        self.values.push(StrRef::new(bytes));
+        self.users.insert(key, id);
         id
     }
 }
@@ -725,6 +741,23 @@ fn price(bytes: &[u8]) -> Option<i64> {
     (1..=10_000_000).contains(&n).then_some(n as i64)
 }
 
+#[inline]
+fn packed_user_id(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() != 9 || bytes[0] != b'u' {
+        return None;
+    }
+    let mut packed = 0u64;
+    for &byte in &bytes[1..] {
+        let digit = match byte {
+            b'0'..=b'9' => u64::from(byte - b'0'),
+            b'a'..=b'z' => u64::from(byte - b'a' + 10),
+            _ => return None,
+        };
+        packed = packed * 36 + digit;
+    }
+    Some(packed)
+}
+
 fn each_row_bytes<const N: usize, F>(bytes: &[u8], mut f: F)
 where
     F: FnMut([&[u8]; N]),
@@ -821,7 +854,7 @@ fn parse_event_chunk(
             user: if row[1].is_empty() {
                 MISSING_ID
             } else {
-                strings.intern(row[1])
+                strings.intern_user(row[1])
             },
             kind,
             product: if row[5].is_empty() {
@@ -1001,7 +1034,7 @@ fn parse_click_file(path: &Path) -> Result<(Box<[u8]>, BorrowedInterner, Vec<Raw
         if let Some(ts) = timestamp_with_cache(ts.as_bytes(), &mut years) {
             clicks.push(RawClick {
                 id: StrRef::new(row[0]),
-                user: strings.intern(user.as_bytes()),
+                user: strings.intern_user(user.as_bytes()),
                 ts,
                 campaign: strings.intern(campaign.as_bytes()),
             });
