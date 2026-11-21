@@ -453,6 +453,52 @@ fn aggregate_user_group(
     user_rows.push(((person, user_day), daily));
 }
 
+fn attribute_user_sessions(
+    sessions: &[Session],
+    clicks: &[Click],
+    organic: Id,
+    daily: &mut FastMap<(Id, i32), CampaignAgg>,
+) {
+    let mut active: BTreeSet<(i64, Reverse<u32>, Id)> = BTreeSet::new();
+    let mut campaign_counts: FastMap<Id, u32> = fast_map();
+    let (mut add, mut remove) = (0usize, 0usize);
+    for session in sessions {
+        while add < clicks.len() && clicks[add].ts <= session.start {
+            let click = clicks[add];
+            active.insert((click.ts, Reverse(click.id), click.campaign));
+            *campaign_counts.entry(click.campaign).or_default() += 1;
+            add += 1;
+        }
+        let cutoff = session.start.saturating_sub(ATTRIBUTION_MS);
+        while remove < add && clicks[remove].ts < cutoff {
+            let click = clicks[remove];
+            active.remove(&(click.ts, Reverse(click.id), click.campaign));
+            if let Some(count) = campaign_counts.get_mut(&click.campaign) {
+                *count -= 1;
+                if *count == 0 {
+                    campaign_counts.remove(&click.campaign);
+                }
+            }
+            remove += 1;
+        }
+        let campaign = active
+            .iter()
+            .next_back()
+            .map(|entry| entry.2)
+            .unwrap_or(organic);
+        let credited = daily.entry((campaign, session.day)).or_default();
+        credited.sessions += 1;
+        credited.revenue += session.revenue;
+        credited.purchasing_sessions += i64::from(session.has_purchase);
+        for &assisted in campaign_counts.keys() {
+            daily
+                .entry((assisted, session.day))
+                .or_default()
+                .assisted_sessions += 1;
+        }
+    }
+}
+
 fn fast_map<K: std::hash::Hash + Eq, V>() -> FastMap<K, V> {
     HashMap::with_hasher(RandomState::new())
 }
@@ -1070,7 +1116,7 @@ fn run() -> Result<(), String> {
         })
         .collect::<Vec<_>>();
     drop(click_sources);
-    let mut campaign_daily: FastMap<(Id, i32), CampaignAgg> = fast_map();
+    let mut attribution_ranges = Vec::new();
     let mut si = 0usize;
     let mut ci = 0usize;
     while si < sessions.len() {
@@ -1086,43 +1132,34 @@ fn run() -> Result<(), String> {
         while ce < clicks.len() && clicks[ce].user == person {
             ce += 1;
         }
-        let person_clicks = &clicks[ci..ce];
-        let mut active: BTreeSet<(i64, Reverse<u32>, Id)> = BTreeSet::new();
-        let mut campaign_counts: FastMap<Id, u32> = fast_map();
-        let (mut add, mut remove) = (0usize, 0usize);
-        for s in &sessions[si..se] {
-            while add < person_clicks.len() && person_clicks[add].ts <= s.start {
-                let c = person_clicks[add];
-                active.insert((c.ts, Reverse(c.id), c.campaign));
-                *campaign_counts.entry(c.campaign).or_default() += 1;
-                add += 1;
-            }
-            let cutoff = s.start.saturating_sub(ATTRIBUTION_MS);
-            while remove < add && person_clicks[remove].ts < cutoff {
-                let c = person_clicks[remove];
-                active.remove(&(c.ts, Reverse(c.id), c.campaign));
-                if let Some(n) = campaign_counts.get_mut(&c.campaign) {
-                    *n -= 1;
-                    if *n == 0 {
-                        campaign_counts.remove(&c.campaign);
-                    }
-                }
-                remove += 1;
-            }
-            let campaign = active.iter().next_back().map(|x| x.2).unwrap_or(organic);
-            let agg = campaign_daily.entry((campaign, s.day)).or_default();
-            agg.sessions += 1;
-            agg.revenue += s.revenue;
-            agg.purchasing_sessions += i64::from(s.has_purchase);
-            for &assisted in campaign_counts.keys() {
-                campaign_daily
-                    .entry((assisted, s.day))
-                    .or_default()
-                    .assisted_sessions += 1;
-            }
-        }
+        attribution_ranges.push((si, se, ci, ce));
         ci = ce;
         si = se;
+    }
+    let partial_campaigns = attribution_ranges
+        .par_chunks(4096)
+        .map(|groups| {
+            let mut daily = fast_map();
+            for &(session_start, session_end, click_start, click_end) in groups {
+                attribute_user_sessions(
+                    &sessions[session_start..session_end],
+                    &clicks[click_start..click_end],
+                    organic,
+                    &mut daily,
+                );
+            }
+            daily
+        })
+        .collect::<Vec<FastMap<(Id, i32), CampaignAgg>>>();
+    let mut campaign_daily: FastMap<(Id, i32), CampaignAgg> = fast_map();
+    for partial in partial_campaigns {
+        for (key, row) in partial {
+            let total = campaign_daily.entry(key).or_default();
+            total.sessions += row.sessions;
+            total.purchasing_sessions += row.purchasing_sessions;
+            total.revenue += row.revenue;
+            total.assisted_sessions += row.assisted_sessions;
+        }
     }
 
     let user_totals = users
