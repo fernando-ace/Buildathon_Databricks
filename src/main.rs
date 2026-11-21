@@ -171,19 +171,22 @@ const ATTRIBUTION_MS: i64 = 604_800_000;
 
 #[derive(Default)]
 struct Interner {
-    values: Vec<Arc<str>>,
-    ids: FastMap<Arc<str>, Id>,
+    // StrRef keys point into these Box allocations, which stay stable as this Vec grows.
+    values: Vec<Box<str>>,
+    ids: FastMap<StrRef, Id>,
 }
 
 impl Interner {
     fn intern(&mut self, text: &str) -> Id {
-        if let Some(&id) = self.ids.get(text) {
+        let lookup = StrRef::new(text.as_bytes());
+        if let Some(&id) = self.ids.get(&lookup) {
             return id;
         }
-        let text: Arc<str> = Arc::from(text);
+        let text: Box<str> = text.into();
+        let key = StrRef::new(text.as_bytes());
         let id = self.values.len() as Id;
-        self.values.push(text.clone());
-        self.ids.insert(text, id);
+        self.values.push(text);
+        self.ids.insert(key, id);
         id
     }
 
