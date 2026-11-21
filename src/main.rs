@@ -1,7 +1,7 @@
 use ahash::{AHasher, RandomState};
 use arrow_array::{ArrayRef, Date32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use memchr::{memchr, memchr2, memchr_iter};
+use memchr::{memchr, memchr_iter, memchr2};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -898,7 +898,13 @@ fn parse_event_chunk(
 
 fn parse_event_file(
     path: &Path,
-) -> Result<(Box<[u8]>, Vec<(BorrowedInterner, Vec<(u64, StrRef, Event)>)>), String> {
+) -> Result<
+    (
+        Box<[u8]>,
+        Vec<(BorrowedInterner, Vec<(u64, StrRef, Event)>)>,
+    ),
+    String,
+> {
     const CHUNK_SIZE: usize = 16 * 1024 * 1024;
     let bytes = fs::read(path)
         .map_err(|e| format!("read {}: {e}", path.display()))?
@@ -911,8 +917,7 @@ fn parse_event_file(
             bytes.len()
         } else {
             target
-                + memchr(b'\n', &bytes[target..])
-                    .map_or(bytes.len() - target, |offset| offset + 1)
+                + memchr(b'\n', &bytes[target..]).map_or(bytes.len() - target, |offset| offset + 1)
         };
         ranges.push((start, end));
         start = end;
