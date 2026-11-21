@@ -388,6 +388,71 @@ struct CampaignAgg {
     assisted_sessions: i64,
 }
 
+fn aggregate_user_group(
+    events: &[Event],
+    products: &FastMap<Id, Id>,
+    unknown: Id,
+    user_rows: &mut Vec<((Id, i32), UserAgg)>,
+    sessions: &mut Vec<Session>,
+) {
+    let person = events[0].user.unwrap();
+    let first_ts = events[0].ts.unwrap();
+    let mut session_start = first_ts;
+    let mut session_day = day(first_ts);
+    let mut user_day = session_day;
+    let mut daily = UserAgg::default();
+    let mut session_revenue = 0i64;
+    let mut session_purchase = false;
+    let mut previous_ts = first_ts;
+
+    for (index, event) in events.iter().enumerate() {
+        let ts = event.ts.unwrap();
+        let new_session = index == 0 || ts - previous_ts > SESSION_GAP_MS;
+        if index > 0 && new_session {
+            sessions.push(Session {
+                person,
+                start: session_start,
+                day: session_day,
+                revenue: session_revenue,
+                has_purchase: session_purchase,
+            });
+            session_start = ts;
+            session_day = day(ts);
+            if session_day != user_day {
+                user_rows.push(((person, user_day), daily));
+                daily = UserAgg::default();
+                user_day = session_day;
+            }
+            session_revenue = 0;
+            session_purchase = false;
+        }
+
+        daily.events += 1;
+        if event.kind == 2 {
+            let amount = event.price.unwrap();
+            session_revenue += amount;
+            session_purchase = true;
+            daily.revenue += amount;
+            let product = event.product.unwrap();
+            let category = *products.get(&product).unwrap_or(&unknown);
+            *daily.categories.entry(category).or_default() += amount;
+        }
+        if new_session {
+            daily.sessions += 1;
+        }
+        previous_ts = ts;
+    }
+
+    sessions.push(Session {
+        person,
+        start: session_start,
+        day: session_day,
+        revenue: session_revenue,
+        has_purchase: session_purchase,
+    });
+    user_rows.push(((person, user_day), daily));
+}
+
 fn fast_map<K: std::hash::Hash + Eq, V>() -> FastMap<K, V> {
     HashMap::with_hasher(RandomState::new())
 }
@@ -944,60 +1009,39 @@ fn run() -> Result<(), String> {
         phase.elapsed().as_secs_f64()
     );
     let phase = Instant::now();
-    let mut users: FastMap<(Id, i32), UserAgg> = fast_map();
-    let mut sessions = Vec::new();
+    let mut user_ranges = Vec::new();
     let mut i = 0;
     while i < surviving.len() {
-        let first = surviving[i];
-        let person = first.user.unwrap();
-        let mut session_start = first.ts.unwrap();
-        let mut session_day = day(session_start);
-        let mut session_revenue = 0i64;
-        let mut session_purchase = false;
-        let mut previous_ts = session_start;
-        let mut j = i;
-        while j < surviving.len() && surviving[j].user.unwrap() == person {
-            let ts = surviving[j].ts.unwrap();
-            let new_session = j == i || ts - previous_ts > SESSION_GAP_MS;
-            if j != i && new_session {
-                sessions.push(Session {
-                    person,
-                    start: session_start,
-                    day: session_day,
-                    revenue: session_revenue,
-                    has_purchase: session_purchase,
-                });
-                session_start = ts;
-                session_day = day(ts);
-                session_revenue = 0;
-                session_purchase = false;
-            }
-            let e = surviving[j];
-            let agg = users.entry((person, session_day)).or_default();
-            agg.events += 1;
-            if e.kind == 2 {
-                let amount = e.price.unwrap();
-                session_revenue += amount;
-                session_purchase = true;
-                agg.revenue += amount;
-                let product = e.product.unwrap();
-                let category = *products.get(&product).unwrap_or(&unknown);
-                *agg.categories.entry(category).or_default() += amount;
-            }
-            if new_session {
-                users.entry((person, session_day)).or_default().sessions += 1;
-            }
-            previous_ts = ts;
-            j += 1;
+        let person = surviving[i].user.unwrap();
+        let mut end = i + 1;
+        while end < surviving.len() && surviving[end].user == Some(person) {
+            end += 1;
         }
-        sessions.push(Session {
-            person,
-            start: session_start,
-            day: session_day,
-            revenue: session_revenue,
-            has_purchase: session_purchase,
-        });
-        i = j;
+        user_ranges.push((i, end));
+        i = end;
+    }
+    let aggregated = user_ranges
+        .par_chunks(512)
+        .map(|ranges| {
+            let mut user_rows = Vec::new();
+            let mut sessions = Vec::new();
+            for &(start, end) in ranges {
+                aggregate_user_group(
+                    &surviving[start..end],
+                    &products,
+                    unknown,
+                    &mut user_rows,
+                    &mut sessions,
+                );
+            }
+            (user_rows, sessions)
+        })
+        .collect::<Vec<_>>();
+    let mut users = Vec::new();
+    let mut sessions = Vec::new();
+    for (mut user_rows, mut user_sessions) in aggregated {
+        users.append(&mut user_rows);
+        sessions.append(&mut user_sessions);
     }
 
     eprintln!(
@@ -1082,8 +1126,8 @@ fn run() -> Result<(), String> {
     }
 
     let user_totals = users
-        .values()
-        .fold((0i64, 0i64), |(sessions, revenue), row| {
+        .iter()
+        .fold((0i64, 0i64), |(sessions, revenue), (_, row)| {
             (sessions + row.sessions, revenue + row.revenue)
         });
     let campaign_totals = campaign_daily.iter().fold(
@@ -1131,7 +1175,7 @@ fn run() -> Result<(), String> {
 fn write_outputs(
     out: &Path,
     strings: &Interner,
-    users: &FastMap<(Id, i32), UserAgg>,
+    users: &[((Id, i32), UserAgg)],
     campaigns_daily: &FastMap<(Id, i32), CampaignAgg>,
     channels: &FastMap<Id, Id>,
 ) -> Result<(), String> {
@@ -1143,9 +1187,9 @@ fn write_outputs(
     let mut user_events = Vec::with_capacity(user_rows.len());
     let mut user_revenue = Vec::with_capacity(user_rows.len());
     let mut top_category = Vec::with_capacity(user_rows.len());
-    for (&(user, d), agg) in user_rows {
-        user_ids.push(strings.get(user));
-        user_days.push(d);
+    for ((user, d), agg) in user_rows {
+        user_ids.push(strings.get(*user));
+        user_days.push(*d);
         user_sessions.push(agg.sessions);
         user_events.push(agg.events);
         user_revenue.push(agg.revenue);
