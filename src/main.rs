@@ -7,7 +7,7 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use rayon::prelude::*;
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, File};
 use std::hash::{BuildHasherDefault, Hash, Hasher};
@@ -473,21 +473,30 @@ fn attribute_user_sessions(
     clicks: &[Click],
     organic: Id,
     daily: &mut FastMap<(Id, i32), CampaignAgg>,
+    active: &mut VecDeque<Click>,
+    campaign_counts: &mut FastMap<Id, u32>,
 ) {
-    let mut active: BTreeSet<(i64, Reverse<u32>, Id)> = BTreeSet::new();
-    let mut campaign_counts: FastMap<Id, u32> = fast_map();
+    active.clear();
+    campaign_counts.clear();
     let (mut add, mut remove) = (0usize, 0usize);
     for session in sessions {
         while add < clicks.len() && clicks[add].ts <= session.start {
             let click = clicks[add];
-            active.insert((click.ts, Reverse(click.id), click.campaign));
+            while active.back().is_some_and(|last| {
+                click.ts > last.ts || (click.ts == last.ts && click.id < last.id)
+            }) {
+                active.pop_back();
+            }
+            active.push_back(click);
             *campaign_counts.entry(click.campaign).or_default() += 1;
             add += 1;
         }
         let cutoff = session.start.saturating_sub(ATTRIBUTION_MS);
         while remove < add && clicks[remove].ts < cutoff {
             let click = clicks[remove];
-            active.remove(&(click.ts, Reverse(click.id), click.campaign));
+            while active.front().is_some_and(|first| first.ts < cutoff) {
+                active.pop_front();
+            }
             if let Some(count) = campaign_counts.get_mut(&click.campaign) {
                 *count -= 1;
                 if *count == 0 {
@@ -497,9 +506,8 @@ fn attribute_user_sessions(
             remove += 1;
         }
         let campaign = active
-            .iter()
-            .next_back()
-            .map(|entry| entry.2)
+            .front()
+            .map(|click| click.campaign)
             .unwrap_or(organic);
         let credited = daily.entry((campaign, session.day)).or_default();
         credited.sessions += 1;
@@ -1225,12 +1233,16 @@ fn run() -> Result<(), String> {
         .par_chunks(4096)
         .map(|groups| {
             let mut daily = fast_map();
+            let mut active = VecDeque::new();
+            let mut campaign_counts = fast_map();
             for &(session_start, session_end, click_start, click_end) in groups {
                 attribute_user_sessions(
                     &sessions[session_start..session_end],
                     &clicks[click_start..click_end],
                     organic,
                     &mut daily,
+                    &mut active,
+                    &mut campaign_counts,
                 );
             }
             daily
