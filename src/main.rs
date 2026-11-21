@@ -20,7 +20,6 @@ type Id = u32;
 const MISSING_ID: Id = Id::MAX;
 type FastMap<K, V> = HashMap<K, V, RandomState>;
 type FastSet<K> = HashSet<K, RandomState>;
-type LocalEventMap = hashbrown::HashMap<u64, (StrRef, Event), BuildHasherDefault<IdentityHasher>>;
 type ShardEventMap = hashbrown::HashMap<u64, (IdRef, Event), BuildHasherDefault<IdentityHasher>>;
 
 #[derive(Clone, Copy)]
@@ -86,11 +85,6 @@ impl Hasher for IdentityHasher {
     fn write_u64(&mut self, value: u64) {
         self.0 = value;
     }
-}
-
-struct EventDeduper {
-    primary: LocalEventMap,
-    collisions: FastMap<u64, Vec<(StrRef, Event)>>,
 }
 
 struct EventShard {
@@ -168,82 +162,6 @@ impl EventShard {
                 .flatten()
                 .map(|(_, event)| event),
         );
-    }
-}
-
-impl EventDeduper {
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            primary: LocalEventMap::with_capacity_and_hasher(
-                capacity,
-                BuildHasherDefault::default(),
-            ),
-            collisions: fast_map(),
-        }
-    }
-
-    fn insert(&mut self, id: StrRef, event: Event) {
-        let mut hasher = AHasher::default();
-        id.hash(&mut hasher);
-        let hash = hasher.finish();
-        self.insert_hashed(hash, id, event);
-    }
-
-    fn insert_hashed(&mut self, hash: u64, id: StrRef, event: Event) {
-        match self
-            .primary
-            .raw_entry_mut()
-            .from_hash(hash, |stored_hash| *stored_hash == hash)
-        {
-            hashbrown::hash_map::RawEntryMut::Vacant(entry) => {
-                entry.insert_hashed_nocheck(hash, hash, (id, event));
-            }
-            hashbrown::hash_map::RawEntryMut::Occupied(mut entry) => {
-                let (stored_id, stored_event) = entry.get_mut();
-                if *stored_id == id {
-                    if (event.ingest, event.file_order)
-                        < (stored_event.ingest, stored_event.file_order)
-                    {
-                        *stored_event = event;
-                    }
-                    return;
-                }
-                let collisions = self.collisions.entry(hash).or_default();
-                if let Some((_, stored_event)) = collisions
-                    .iter_mut()
-                    .find(|(candidate, _)| *candidate == id)
-                {
-                    if (event.ingest, event.file_order)
-                        < (stored_event.ingest, stored_event.file_order)
-                    {
-                        *stored_event = event;
-                    }
-                } else {
-                    collisions.push((id, event));
-                }
-            }
-        }
-    }
-
-    fn drain_into(self, partitions: &mut [Vec<(u64, StrRef, Event)>], remap: &[Id]) {
-        let push = |hash: u64,
-                    id: StrRef,
-                    mut event: Event,
-                    partitions: &mut [Vec<(u64, StrRef, Event)>]| {
-            event.user = event.user.map(|id| remap[id as usize]);
-            if event.product != MISSING_ID && event.kind == 2 {
-                event.product = remap[event.product as usize];
-            }
-            partitions[hash as usize % partitions.len()].push((hash, id, event));
-        };
-        for (hash, (id, event)) in self.primary {
-            push(hash, id, event, partitions);
-        }
-        for (hash, events) in self.collisions {
-            for (id, event) in events {
-                push(hash, id, event, partitions);
-            }
-        }
     }
 }
 
@@ -826,12 +744,12 @@ fn parse_campaigns(data: &Path, strings: &mut Interner) -> Result<FastMap<Id, Id
 fn parse_event_file(
     path: &Path,
     file_order: u32,
-) -> Result<(Box<[u8]>, BorrowedInterner, EventDeduper), String> {
+) -> Result<(Box<[u8]>, BorrowedInterner, Vec<(u64, StrRef, Event)>), String> {
     let bytes = fs::read(path)
         .map_err(|e| format!("read {}: {e}", path.display()))?
         .into_boxed_slice();
     let mut strings = BorrowedInterner::with_capacity(bytes.len() / 152);
-    let mut events = EventDeduper::with_capacity(bytes.len() / 76);
+    let mut events = Vec::with_capacity(bytes.len() / 76);
     let mut years = YearStartCache::default();
     each_utf8_row_bytes::<7, _>(&bytes, |row| {
         if row[0].is_empty() {
@@ -858,7 +776,10 @@ fn parse_event_file(
             ingest: timestamp_with_cache(row[3], &mut years).unwrap_or(i64::MAX),
             file_order,
         };
-        events.insert(StrRef::new(row[0]), event);
+        let id = StrRef::new(row[0]);
+        let mut hasher = AHasher::default();
+        id.hash(&mut hasher);
+        events.push((hasher.finish(), id, event));
     });
     Ok((bytes, strings, events))
 }
@@ -912,7 +833,13 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
                 .iter()
                 .map(|value| strings.intern(text(value.bytes()).unwrap()))
                 .collect::<Vec<_>>();
-            local_events.drain_into(&mut partitions, &remap);
+            for (hash, id, mut event) in local_events {
+                event.user = event.user.map(|id| remap[id as usize]);
+                if event.product != MISSING_ID && event.kind == 2 {
+                    event.product = remap[event.product as usize];
+                }
+                partitions[hash as usize % ncpu].push((hash, id, event));
+            }
         }
         shards
             .par_iter_mut()
