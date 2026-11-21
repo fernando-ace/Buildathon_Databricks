@@ -10,6 +10,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
+use std::hash::{Hash, Hasher};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,6 +19,45 @@ use std::time::Instant;
 type Id = u32;
 type FastMap<K, V> = HashMap<K, V, RandomState>;
 type FastSet<K> = HashSet<K, RandomState>;
+
+#[derive(Clone, Copy)]
+struct StrRef {
+    ptr: *const u8,
+    len: usize,
+}
+
+// These pointers refer into Box<[u8]> buffers owned by the event-file batch.
+// The buffers are retained until the event-ID map is consumed.
+unsafe impl Send for StrRef {}
+unsafe impl Sync for StrRef {}
+
+impl StrRef {
+    fn new(bytes: &[u8]) -> Self {
+        Self {
+            ptr: bytes.as_ptr(),
+            len: bytes.len(),
+        }
+    }
+
+    fn bytes<'a>(self) -> &'a [u8] {
+        // The caller keeps the source file buffer alive while this reference is used.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl PartialEq for StrRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len && self.bytes() == other.bytes()
+    }
+}
+
+impl Eq for StrRef {}
+
+impl Hash for StrRef {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.bytes().hash(state);
+    }
+}
 const DAY_MS: i64 = 86_400_000;
 const SESSION_GAP_MS: i64 = 1_800_000;
 const ATTRIBUTION_MS: i64 = 604_800_000;
@@ -299,11 +339,10 @@ fn price(bytes: &[u8]) -> Option<i64> {
     (1..=10_000_000).contains(&n).then_some(n as i64)
 }
 
-fn each_row<const N: usize, F>(path: &Path, mut f: F) -> Result<(), String>
+fn each_row_bytes<const N: usize, F>(bytes: &[u8], mut f: F)
 where
     F: FnMut([&[u8]; N]),
 {
-    let bytes = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let mut lines = bytes.split(|b| *b == b'\n');
     let _header = lines.next();
     for line in lines {
@@ -311,6 +350,14 @@ where
             f(row);
         }
     }
+}
+
+fn each_row<const N: usize, F>(path: &Path, f: F) -> Result<(), String>
+where
+    F: FnMut([&[u8]; N]),
+{
+    let bytes = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    each_row_bytes::<N, _>(&bytes, f);
     Ok(())
 }
 
@@ -348,10 +395,13 @@ fn parse_campaigns(data: &Path, strings: &mut Interner) -> Result<FastMap<Id, Id
     Ok(campaigns)
 }
 
-fn parse_event_file(path: &Path) -> Result<(Interner, FastMap<String, Event>), String> {
+fn parse_event_file(path: &Path) -> Result<(Box<[u8]>, Interner, FastMap<StrRef, Event>), String> {
+    let bytes = fs::read(path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?
+        .into_boxed_slice();
     let mut strings = Interner::default();
-    let mut events: FastMap<String, Event> = fast_map();
-    each_row::<7, _>(path, |row| {
+    let mut events: FastMap<StrRef, Event> = fast_map();
+    each_row_bytes::<7, _>(&bytes, |row| {
         let (
             Some(event_id),
             Some(user),
@@ -389,7 +439,7 @@ fn parse_event_file(path: &Path) -> Result<(Interner, FastMap<String, Event>), S
             price: (kind == 2).then(|| price(price_raw.as_bytes())).flatten(),
             ingest: timestamp(ingest.as_bytes()).unwrap_or(i64::MAX),
         };
-        match events.entry(event_id.to_owned()) {
+        match events.entry(StrRef::new(row[0])) {
             std::collections::hash_map::Entry::Vacant(e) => {
                 e.insert(event);
             }
@@ -399,19 +449,21 @@ fn parse_event_file(path: &Path) -> Result<(Interner, FastMap<String, Event>), S
                 }
             }
         }
-    })?;
-    Ok((strings, events))
+    });
+    Ok((bytes, strings, events))
 }
 
 fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<Event>, String> {
     let paths = csv_files(&data.join("events"))?;
-    let mut merged: FastMap<String, Event> = fast_map();
+    let mut merged: FastMap<StrRef, Event> = fast_map();
+    let mut source_buffers: Vec<Box<[u8]>> = Vec::with_capacity(paths.len());
     for batch in paths.chunks(ncpu) {
         let parsed = batch
             .par_iter()
             .map(|path| parse_event_file(path))
             .collect::<Result<Vec<_>, _>>()?;
-        for (local_strings, mut local_events) in parsed {
+        for (source, local_strings, mut local_events) in parsed {
+            source_buffers.push(source);
             let remap = local_strings
                 .values
                 .iter()
@@ -433,20 +485,25 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
             }
         }
     }
-    Ok(merged.into_values().collect())
+    let events = merged.into_values().collect();
+    drop(source_buffers);
+    Ok(events)
 }
 
 fn parse_click_file(path: &Path) -> Result<(Interner, Vec<Click>), String> {
+    let bytes = fs::read(path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?
+        .into_boxed_slice();
     let mut strings = Interner::default();
-    let mut seen: FastSet<String> = fast_set();
+    let mut seen: FastSet<StrRef> = fast_set();
     let mut clicks = Vec::new();
-    each_row::<4, _>(path, |row| {
+    each_row_bytes::<4, _>(&bytes, |row| {
         let (Some(id), Some(user), Some(campaign), Some(ts)) =
             (text(row[0]), text(row[1]), text(row[2]), text(row[3]))
         else {
             return;
         };
-        if id.is_empty() || user.is_empty() || !seen.insert(id.to_owned()) {
+        if id.is_empty() || user.is_empty() || !seen.insert(StrRef::new(row[0])) {
             return;
         }
         if let Some(ts) = timestamp(ts.as_bytes()) {
@@ -457,7 +514,7 @@ fn parse_click_file(path: &Path) -> Result<(Interner, Vec<Click>), String> {
                 campaign: strings.intern(campaign),
             });
         }
-    })?;
+    });
     Ok((strings, clicks))
 }
 
