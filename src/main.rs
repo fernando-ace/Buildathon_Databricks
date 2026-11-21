@@ -281,6 +281,13 @@ struct BorrowedInterner {
 }
 
 impl BorrowedInterner {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            values: Vec::with_capacity(capacity),
+            ids: fast_map_with_capacity(capacity),
+        }
+    }
+
     fn intern(&mut self, bytes: &[u8]) -> Id {
         let key = StrRef::new(bytes);
         if let Some(&id) = self.ids.get(&key) {
@@ -511,8 +518,16 @@ fn fast_map<K: std::hash::Hash + Eq, V>() -> FastMap<K, V> {
     HashMap::with_hasher(RandomState::new())
 }
 
+fn fast_map_with_capacity<K: std::hash::Hash + Eq, V>(capacity: usize) -> FastMap<K, V> {
+    HashMap::with_capacity_and_hasher(capacity, RandomState::new())
+}
+
 fn fast_set<K: std::hash::Hash + Eq>() -> FastSet<K> {
     HashSet::with_hasher(RandomState::new())
+}
+
+fn fast_set_with_capacity<K: std::hash::Hash + Eq>(capacity: usize) -> FastSet<K> {
+    HashSet::with_capacity_and_hasher(capacity, RandomState::new())
 }
 
 fn csv_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
@@ -761,7 +776,7 @@ fn parse_event_file(
     let bytes = fs::read(path)
         .map_err(|e| format!("read {}: {e}", path.display()))?
         .into_boxed_slice();
-    let mut strings = BorrowedInterner::default();
+    let mut strings = BorrowedInterner::with_capacity(bytes.len() / 152);
     let mut events = EventDeduper::with_capacity(bytes.len() / 76);
     each_utf8_row_bytes::<7, _>(&bytes, |row| {
         if row[0].is_empty() {
@@ -869,8 +884,8 @@ fn parse_click_file(path: &Path) -> Result<(Box<[u8]>, BorrowedInterner, Vec<Raw
     let bytes = fs::read(path)
         .map_err(|e| format!("read {}: {e}", path.display()))?
         .into_boxed_slice();
-    let mut strings = BorrowedInterner::default();
-    let mut seen: FastSet<StrRef> = fast_set();
+    let mut strings = BorrowedInterner::with_capacity(bytes.len() / 100);
+    let mut seen: FastSet<StrRef> = fast_set_with_capacity(bytes.len() / 64);
     let mut clicks = Vec::new();
     each_row_bytes::<4, _>(&bytes, |row| {
         let (Some(id), Some(user), Some(campaign), Some(ts)) =
