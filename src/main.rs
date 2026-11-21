@@ -1,7 +1,7 @@
 use ahash::{AHasher, RandomState};
 use arrow_array::{ArrayRef, Date32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use memchr::{memchr, memchr2};
+use memchr::{memchr, memchr2, memchr_iter};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -762,28 +762,44 @@ fn each_row_bytes<const N: usize, F>(bytes: &[u8], mut f: F)
 where
     F: FnMut([&[u8]; N]),
 {
-    let mut lines = bytes.split(|b| *b == b'\n');
-    let _header = lines.next();
-    for line in lines {
-        if let Some(row) = fields::<N>(line) {
-            f(row);
-        }
-    }
+    each_lines::<N, _, false>(bytes, true, &mut f);
 }
 
 fn each_utf8_row_bytes<const N: usize, F>(bytes: &[u8], skip_header: bool, mut f: F)
 where
     F: FnMut([&[u8]; N]),
 {
-    let mut lines = bytes.split(|b| *b == b'\n');
-    if skip_header {
-        let _header = lines.next();
+    each_lines::<N, _, true>(bytes, skip_header, &mut f);
+}
+
+fn each_lines<const N: usize, F, const VALIDATE_UTF8: bool>(
+    bytes: &[u8],
+    mut skip_header: bool,
+    f: &mut F,
+) where
+    F: FnMut([&[u8]; N]),
+{
+    let mut start = 0;
+    for end in memchr_iter(b'\n', bytes) {
+        let line = &bytes[start..end];
+        start = end + 1;
+        if skip_header {
+            skip_header = false;
+            continue;
+        }
+        if VALIDATE_UTF8 && std::str::from_utf8(line).is_err() {
+            continue;
+        }
+        if let Some(row) = fields::<N>(line) {
+            f(row);
+        }
     }
-    for line in lines {
-        if std::str::from_utf8(line).is_ok() {
-            if let Some(row) = fields::<N>(line) {
-                f(row);
-            }
+    if !skip_header {
+        let line = &bytes[start..];
+        if (!VALIDATE_UTF8 || std::str::from_utf8(line).is_ok())
+            && let Some(row) = fields::<N>(line)
+        {
+            f(row);
         }
     }
 }
