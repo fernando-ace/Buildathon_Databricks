@@ -859,23 +859,37 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
             .par_iter()
             .map(|path| parse_event_file(path))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut source_buffers = Vec::with_capacity(parsed.len());
-        let mut partitions = (0..ncpu).map(|_| Vec::new()).collect::<Vec<_>>();
+        let mut prepared = Vec::with_capacity(parsed.len());
         for (source, local_strings, local_events) in parsed {
-            source_buffers.push(source);
             let remap = local_strings
                 .values
                 .iter()
                 .map(|value| strings.intern(text(value.bytes()).unwrap()))
                 .collect::<Vec<_>>();
-            for (hash, id, mut event) in local_events {
-                if event.user != MISSING_ID {
-                    event.user = remap[event.user as usize];
+            prepared.push((source, local_events, remap));
+        }
+        let file_partitions = prepared
+            .into_par_iter()
+            .map(|(source, local_events, remap)| {
+                let mut partitions = (0..ncpu).map(|_| Vec::new()).collect::<Vec<_>>();
+                for (hash, id, mut event) in local_events {
+                    if event.user != MISSING_ID {
+                        event.user = remap[event.user as usize];
+                    }
+                    if event.product != MISSING_ID && event.kind == 2 {
+                        event.product = remap[event.product as usize];
+                    }
+                    partitions[hash as usize % ncpu].push((hash, id, event));
                 }
-                if event.product != MISSING_ID && event.kind == 2 {
-                    event.product = remap[event.product as usize];
-                }
-                partitions[hash as usize % ncpu].push((hash, id, event));
+                (source, partitions)
+            })
+            .collect::<Vec<_>>();
+        let mut partitions = (0..ncpu).map(|_| Vec::new()).collect::<Vec<_>>();
+        let mut source_buffers = Vec::with_capacity(file_partitions.len());
+        for (source, mut file_partition) in file_partitions {
+            source_buffers.push(source);
+            for (partition, file_records) in partitions.iter_mut().zip(file_partition.iter_mut()) {
+                partition.append(file_records);
             }
         }
         shards
