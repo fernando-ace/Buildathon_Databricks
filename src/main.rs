@@ -335,29 +335,6 @@ struct RawClick {
     campaign: Id,
 }
 
-#[derive(Default)]
-struct ClickIdSet {
-    packed: FastSet<u64>,
-    other: FastSet<StrRef>,
-}
-
-impl ClickIdSet {
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            packed: fast_set_with_capacity(capacity),
-            other: fast_set_with_capacity(capacity / 8),
-        }
-    }
-
-    fn insert(&mut self, id: StrRef) -> bool {
-        if let Some(key) = fixed_width_id(id.bytes(), b'c') {
-            self.packed.insert(key)
-        } else {
-            self.other.insert(id)
-        }
-    }
-}
-
 #[derive(Clone, Copy)]
 struct Session {
     person: Id,
@@ -509,6 +486,10 @@ fn fast_map_with_capacity<K: std::hash::Hash + Eq, V>(capacity: usize) -> FastMa
     HashMap::with_capacity_and_hasher(capacity, RandomState::new())
 }
 
+fn fast_set<K: std::hash::Hash + Eq>() -> FastSet<K> {
+    HashSet::with_hasher(RandomState::new())
+}
+
 fn fast_set_with_capacity<K: std::hash::Hash + Eq>(capacity: usize) -> FastSet<K> {
     HashSet::with_capacity_and_hasher(capacity, RandomState::new())
 }
@@ -526,23 +507,9 @@ fn csv_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
 
 fn map_file(path: &Path) -> Result<Mmap, String> {
     let file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    if file
-        .metadata()
-        .map_err(|e| format!("stat {}: {e}", path.display()))?
-        .len()
-        == 0
-    {
-        let mut empty = MmapOptions::new()
-            .len(1)
-            .map_anon()
-            .map_err(|e| format!("map empty {}: {e}", path.display()))?;
-        empty[0] = b'\n';
-        return empty
-            .make_read_only()
-            .map_err(|e| format!("protect empty {}: {e}", path.display()));
-    }
     // Input files are immutable for the duration of a run.
-    unsafe { MmapOptions::new().map(&file) }.map_err(|e| format!("map {}: {e}", path.display()))
+    unsafe { MmapOptions::new().map(&file) }
+        .map_err(|e| format!("map {}: {e}", path.display()))
 }
 
 fn fields<const N: usize>(line: &[u8]) -> Option<[&[u8]; N]> {
@@ -711,7 +678,11 @@ fn timestamp_with_cache(bytes: &[u8], years: &mut YearStartCache) -> Option<i64>
     if bytes.len() != 20 && bytes.len() != 25 || bytes.get(4) != Some(&b'-') {
         return ascii_u64(bytes).and_then(|n| i64::try_from(n).ok());
     }
-    if bytes[7] != b'-' || bytes[10] != b'T' || bytes[13] != b':' || bytes[16] != b':' {
+    if bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
         return None;
     }
     let year = four_digits(bytes, 0)?;
@@ -934,7 +905,13 @@ fn parse_event_chunk(
 
 fn parse_event_file(
     path: &Path,
-) -> Result<(Mmap, Vec<(BorrowedInterner, Vec<(u64, StrRef, Event)>)>), String> {
+) -> Result<
+    (
+        Mmap,
+        Vec<(BorrowedInterner, Vec<(u64, StrRef, Event)>)>,
+    ),
+    String,
+> {
     const CHUNK_SIZE: usize = 16 * 1024 * 1024;
     let bytes = map_file(path)?;
     let mut ranges = Vec::with_capacity(bytes.len().div_ceil(CHUNK_SIZE));
@@ -1071,7 +1048,7 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
 fn parse_click_file(path: &Path) -> Result<(Mmap, BorrowedInterner, Vec<RawClick>), String> {
     let bytes = map_file(path)?;
     let mut strings = BorrowedInterner::with_capacity(bytes.len() / 100);
-    let mut seen = ClickIdSet::with_capacity(bytes.len() / 64);
+    let mut seen: FastSet<StrRef> = fast_set_with_capacity(bytes.len() / 64);
     let mut clicks = Vec::new();
     let mut years = YearStartCache::default();
     each_row_bytes::<4, _>(&bytes, |row| {
@@ -1101,7 +1078,7 @@ fn parse_clicks(
     ncpu: usize,
 ) -> Result<(Vec<Mmap>, Vec<RawClick>), String> {
     let paths = csv_files(&data.join("clicks"))?;
-    let mut seen = (0..ncpu).map(|_| ClickIdSet::default()).collect::<Vec<_>>();
+    let mut seen = (0..ncpu).map(|_| fast_set()).collect::<Vec<_>>();
     let mut source_buffers = Vec::with_capacity(paths.len());
     let mut clicks = Vec::new();
     for batch in paths.chunks(paths.len().max(1)) {
