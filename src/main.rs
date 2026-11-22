@@ -916,20 +916,15 @@ fn packed_fixed_id(bytes: &[u8], prefix: u8) -> Option<u64> {
     if bytes.len() != 9 || bytes[0] != prefix {
         return None;
     }
-    let digits = &bytes[1..];
-    if !digits
-        .iter()
-        .all(|&byte| byte.is_ascii_digit() || byte.is_ascii_lowercase())
-    {
-        return None;
-    }
-    Some(spread_fixed_id(u64::from_be_bytes(digits.try_into().unwrap())))
+    Some(spread_fixed_id(u64::from_be_bytes(
+        bytes[1..].try_into().unwrap(),
+    )))
 }
 
 #[inline]
 fn spread_fixed_id(packed: u64) -> u64 {
     // An odd multiplier is a permutation of u64. It preserves exact keys while
-    // moving fixed-width ASCII IDs into hashbrown's high-bit tags.
+    // moving fixed-width ID bytes into hashbrown's high-bit tags.
     packed.wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
