@@ -908,43 +908,34 @@ fn click_id_cmp(a: u64, b: u64, other_click_ids: &[StrRef]) -> std::cmp::Orderin
 
 #[inline]
 fn packed_user_id(bytes: &[u8]) -> Option<u64> {
-    if bytes.len() != 9 || bytes[0] != b'u' {
-        return None;
-    }
-    let mut packed = 0u64;
-    for &byte in &bytes[1..] {
-        let digit = match byte {
-            b'0'..=b'9' => u64::from(byte - b'0'),
-            b'a'..=b'z' => u64::from(byte - b'a' + 10),
-            _ => return None,
-        };
-        packed = packed * 36 + digit;
-    }
-    Some(spread_packed_id(packed))
+    packed_fixed_id(bytes, b'u')
 }
 
 #[inline]
-fn spread_packed_id(packed: u64) -> u64 {
+fn packed_fixed_id(bytes: &[u8], prefix: u8) -> Option<u64> {
+    if bytes.len() != 9 || bytes[0] != prefix {
+        return None;
+    }
+    let digits = &bytes[1..];
+    if !digits
+        .iter()
+        .all(|&byte| byte.is_ascii_digit() || byte.is_ascii_lowercase())
+    {
+        return None;
+    }
+    Some(spread_fixed_id(u64::from_be_bytes(digits.try_into().unwrap())))
+}
+
+#[inline]
+fn spread_fixed_id(packed: u64) -> u64 {
     // An odd multiplier is a permutation of u64. It preserves exact keys while
-    // moving the low-entropy base-36 payload into hashbrown's high-bit tags.
+    // moving fixed-width ASCII IDs into hashbrown's high-bit tags.
     packed.wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
 #[inline]
 fn packed_event_id(bytes: &[u8]) -> Option<u64> {
-    if bytes.len() != 9 || bytes[0] != b'e' {
-        return None;
-    }
-    let mut packed = 0u64;
-    for &byte in &bytes[1..] {
-        let digit = match byte {
-            b'0'..=b'9' => u64::from(byte - b'0'),
-            b'a'..=b'z' => u64::from(byte - b'a' + 10),
-            _ => return None,
-        };
-        packed = packed * 36 + digit;
-    }
-    Some(spread_packed_id(packed))
+    packed_fixed_id(bytes, b'e')
 }
 
 fn each_row_bytes<const N: usize, F>(bytes: &[u8], mut f: F)
