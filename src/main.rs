@@ -787,18 +787,8 @@ fn fixed_width_id(bytes: &[u8], prefix: u8) -> Option<u64> {
 
 #[inline]
 fn event_id_hash(bytes: &[u8]) -> u64 {
-    prefixed_id_hash(bytes, b'e')
-}
-
-#[inline]
-fn click_id_hash(bytes: &[u8]) -> u64 {
-    prefixed_id_hash(bytes, b'c')
-}
-
-#[inline]
-fn prefixed_id_hash(bytes: &[u8], prefix: u8) -> u64 {
     let mut hasher = AHasher::default();
-    if let Some(key) = fixed_width_id(bytes, prefix) {
+    if let Some(key) = fixed_width_id(bytes, b'e') {
         hasher.write_u64(key);
     } else {
         hasher.write(bytes);
@@ -1130,7 +1120,9 @@ fn parse_clicks(
             for mut click in local_clicks {
                 click.user = remap[click.user as usize];
                 click.campaign = remap[click.campaign as usize];
-                let hash = click_id_hash(click.id.bytes());
+                let mut hasher = AHasher::default();
+                hasher.write(click.id.bytes());
+                let hash = hasher.finish();
                 partitions[hash as usize % ncpu].push(click);
             }
         }
