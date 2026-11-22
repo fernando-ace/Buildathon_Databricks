@@ -273,6 +273,18 @@ impl BorrowedInterner {
         }
     }
 
+    fn for_event_chunk(bytes: usize) -> Self {
+        let users = bytes / 320;
+        Self {
+            values: Vec::with_capacity(users),
+            ids: fast_map_with_capacity(bytes / 8192),
+            users: PackedUserMap::with_capacity_and_hasher(
+                users,
+                BuildHasherDefault::default(),
+            ),
+        }
+    }
+
     fn intern(&mut self, bytes: &[u8]) -> Id {
         let key = StrRef::new(bytes);
         if let Some(&id) = self.ids.get(&key) {
@@ -1058,7 +1070,7 @@ fn parse_event_chunk(
     bytes: &[u8],
     skip_header: bool,
 ) -> (BorrowedInterner, Vec<StrRef>, Vec<EventRecord>) {
-    let mut strings = BorrowedInterner::with_capacity(bytes.len() / 152);
+    let mut strings = BorrowedInterner::for_event_chunk(bytes.len());
     let mut events = Vec::with_capacity(bytes.len() / 76);
     let mut fallback_ids = Vec::new();
     let mut years = YearStartCache::default();
@@ -1117,7 +1129,7 @@ fn parse_event_file(
     ),
     String,
 > {
-    const CHUNK_SIZE: usize = 16 * 1024 * 1024;
+    const CHUNK_SIZE: usize = 32 * 1024 * 1024;
     let bytes = fs::read(path)
         .map_err(|e| format!("read {}: {e}", path.display()))?
         .into_boxed_slice();
