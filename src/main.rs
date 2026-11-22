@@ -920,7 +920,14 @@ fn packed_user_id(bytes: &[u8]) -> Option<u64> {
         };
         packed = packed * 36 + digit;
     }
-    Some(packed)
+    Some(spread_packed_id(packed))
+}
+
+#[inline]
+fn spread_packed_id(packed: u64) -> u64 {
+    // An odd multiplier is a permutation of u64. It preserves exact keys while
+    // moving the low-entropy base-36 payload into hashbrown's high-bit tags.
+    packed.wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
 #[inline]
@@ -937,9 +944,7 @@ fn packed_event_id(bytes: &[u8]) -> Option<u64> {
         };
         packed = packed * 36 + digit;
     }
-    // Keep this an injective key while spreading its high bits: hashbrown uses
-    // the top seven bits as its control-byte fingerprint.
-    Some(packed.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+    Some(spread_packed_id(packed))
 }
 
 fn each_row_bytes<const N: usize, F>(bytes: &[u8], mut f: F)
