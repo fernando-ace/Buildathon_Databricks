@@ -25,6 +25,8 @@ type FastMap<K, V> = HashMap<K, V, RandomState>;
 type FastSet<K> = HashSet<K, RandomState>;
 type PackedUserMap = hashbrown::HashMap<u64, Id, BuildHasherDefault<IdentityHasher>>;
 type ShardEventMap = hashbrown::HashMap<u64, (IdRef, Event), BuildHasherDefault<IdentityHasher>>;
+type PackedEventMap = hashbrown::HashMap<u64, Event, BuildHasherDefault<IdentityHasher>>;
+type EventRecord = (u64, Id, Event);
 
 #[derive(Clone, Copy)]
 struct StrRef {
@@ -92,16 +94,23 @@ impl Hasher for IdentityHasher {
 }
 
 struct EventShard {
-    primary: ShardEventMap,
+    primary: PackedEventMap,
+    fallback: ShardEventMap,
     collisions: FastMap<u64, Vec<(IdRef, Event)>>,
     ids: Vec<u8>,
 }
 
+const PACKED_EVENT_ID: u64 = 1 << 63;
+
 impl EventShard {
     fn with_capacity(capacity: usize) -> Self {
         Self {
-            primary: ShardEventMap::with_capacity_and_hasher(
+            primary: PackedEventMap::with_capacity_and_hasher(
                 capacity,
+                BuildHasherDefault::default(),
+            ),
+            fallback: ShardEventMap::with_capacity_and_hasher(
+                capacity / 100,
                 BuildHasherDefault::default(),
             ),
             collisions: fast_map(),
@@ -110,8 +119,23 @@ impl EventShard {
     }
 
     fn insert(&mut self, hash: u64, id: StrRef, event: Event) {
+        if hash & PACKED_EVENT_ID != 0 {
+            match self.primary.entry(hash) {
+                hashbrown::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(event);
+                }
+                hashbrown::hash_map::Entry::Occupied(mut entry) => {
+                    let stored_event = entry.get_mut();
+                    if event.ingest_seconds < stored_event.ingest_seconds {
+                        *stored_event = event;
+                    }
+                }
+            }
+            return;
+        }
+
         match self
-            .primary
+            .fallback
             .raw_entry_mut()
             .from_hash(hash, |stored_hash| *stored_hash == hash)
         {
@@ -156,7 +180,8 @@ impl EventShard {
     }
 
     fn append_events(self, events: &mut Vec<Event>) {
-        events.extend(self.primary.into_values().map(|(_, event)| event));
+        events.extend(self.primary.into_values());
+        events.extend(self.fallback.into_values().map(|(_, event)| event));
         events.extend(
             self.collisions
                 .into_values()
@@ -900,6 +925,23 @@ fn packed_user_id(bytes: &[u8]) -> Option<u64> {
     Some(packed)
 }
 
+#[inline]
+fn packed_event_id(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() != 9 || bytes[0] != b'e' {
+        return None;
+    }
+    let mut packed = 0u64;
+    for &byte in &bytes[1..] {
+        let digit = match byte {
+            b'0'..=b'9' => u64::from(byte - b'0'),
+            b'a'..=b'z' => u64::from(byte - b'a' + 10),
+            _ => return None,
+        };
+        packed = packed * 36 + digit;
+    }
+    Some(PACKED_EVENT_ID | packed)
+}
+
 fn each_row_bytes<const N: usize, F>(bytes: &[u8], mut f: F)
 where
     F: FnMut([&[u8]; N]),
@@ -992,9 +1034,10 @@ fn parse_campaigns(data: &Path, strings: &mut Interner) -> Result<FastMap<Id, Id
 fn parse_event_chunk(
     bytes: &[u8],
     skip_header: bool,
-) -> (BorrowedInterner, Vec<(u64, StrRef, Event)>) {
+) -> (BorrowedInterner, Vec<StrRef>, Vec<EventRecord>) {
     let mut strings = BorrowedInterner::with_capacity(bytes.len() / 152);
     let mut events = Vec::with_capacity(bytes.len() / 76);
+    let mut fallback_ids = Vec::new();
     let mut years = YearStartCache::default();
     each_utf8_row_bytes::<7, _>(bytes, skip_header, |row| {
         if row[0].is_empty() {
@@ -1028,12 +1071,18 @@ fn parse_event_chunk(
             INVALID_PRICE_CENTS
         };
         let event = Event::new(ts, ingest, user, product, price, kind);
-        let id = StrRef::new(row[0]);
-        let mut hasher = AHasher::default();
-        hasher.write(row[0]);
-        events.push((hasher.finish(), id, event));
+        let (id_key, fallback_id) = if let Some(key) = packed_event_id(row[0]) {
+            (key, MISSING_ID)
+        } else {
+            let mut hasher = AHasher::default();
+            hasher.write(row[0]);
+            let index = fallback_ids.len() as Id;
+            fallback_ids.push(StrRef::new(row[0]));
+            (hasher.finish() & !PACKED_EVENT_ID, index)
+        };
+        events.push((id_key, fallback_id, event));
     });
-    (strings, events)
+    (strings, fallback_ids, events)
 }
 
 fn parse_event_file(
@@ -1041,7 +1090,7 @@ fn parse_event_file(
 ) -> Result<
     (
         Box<[u8]>,
-        Vec<(BorrowedInterner, Vec<(u64, StrRef, Event)>)>,
+        Vec<(BorrowedInterner, Vec<StrRef>, Vec<EventRecord>)>,
     ),
     String,
 > {
@@ -1117,13 +1166,13 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
         for (source, chunks) in parsed {
             let chunks = chunks
                 .into_iter()
-                .map(|(local_strings, local_events)| {
+                .map(|(local_strings, fallback_ids, local_events)| {
                     let remap = local_strings
                         .values
                         .iter()
                         .map(|value| strings.intern(text(value.bytes()).unwrap()))
                         .collect::<Vec<_>>();
-                    (local_events, remap)
+                    (local_events, remap, fallback_ids)
                 })
                 .collect::<Vec<_>>();
             prepared.push((source, chunks));
@@ -1132,8 +1181,16 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
             .into_par_iter()
             .map(|(source, chunks)| {
                 let mut partitions = (0..ncpu).map(|_| Vec::new()).collect::<Vec<_>>();
-                for (local_events, remap) in chunks {
-                    for (hash, id, mut event) in local_events {
+                let mut fallback_ids = Vec::new();
+                for (local_events, remap, chunk_fallback_ids) in chunks {
+                    let fallback_offset = fallback_ids.len() as Id;
+                    fallback_ids.extend(chunk_fallback_ids);
+                    for (hash, fallback_id, mut event) in local_events {
+                        let fallback_id = if fallback_id == MISSING_ID {
+                            MISSING_ID
+                        } else {
+                            fallback_id + fallback_offset
+                        };
                         let user = event.user();
                         if user != MISSING_ID {
                             event.set_user(remap[user as usize]);
@@ -1142,10 +1199,10 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
                         if product != MISSING_ID && event.kind() == 2 {
                             event.set_product(remap[product as usize]);
                         }
-                        partitions[hash as usize % ncpu].push((hash, id, event));
+                        partitions[hash as usize % ncpu].push((hash, fallback_id, event));
                     }
                 }
-                (source, partitions)
+                (source, fallback_ids, partitions)
             })
             .collect::<Vec<_>>();
         let file_count = file_partitions.len();
@@ -1153,8 +1210,10 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
             .map(|_| Vec::with_capacity(file_count))
             .collect::<Vec<_>>();
         let mut source_buffers = Vec::with_capacity(file_count);
-        for (source, file_partition) in file_partitions {
+        let mut file_fallback_ids = Vec::with_capacity(file_count);
+        for (source, fallback_ids, file_partition) in file_partitions {
             source_buffers.push(source);
+            file_fallback_ids.push(fallback_ids);
             for (partition, file_records) in partitions.iter_mut().zip(file_partition) {
                 partition.push(file_records);
             }
@@ -1163,17 +1222,27 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
             .par_iter_mut()
             .zip(partitions.into_par_iter())
             .for_each(|(shard, file_records)| {
-                for records in file_records {
-                    for (hash, event_id, event) in records {
+                for (records, fallback_ids) in file_records.into_iter().zip(&file_fallback_ids) {
+                    for (hash, fallback_id, event) in records {
+                        let event_id = if fallback_id == MISSING_ID {
+                            StrRef::new(&[])
+                        } else {
+                            fallback_ids[fallback_id as usize]
+                        };
                         shard.insert(hash, event_id, event);
                     }
                 }
             });
+        drop(file_fallback_ids);
         drop(source_buffers);
     }
     let total_events = shards
         .iter()
-        .map(|shard| shard.primary.len() + shard.collisions.values().map(Vec::len).sum::<usize>())
+        .map(|shard| {
+            shard.primary.len()
+                + shard.fallback.len()
+                + shard.collisions.values().map(Vec::len).sum::<usize>()
+        })
         .sum();
     let mut events = Vec::with_capacity(total_events);
     for shard in shards {
