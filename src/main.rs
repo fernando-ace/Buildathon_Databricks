@@ -16,6 +16,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 type Id = u32;
 const MISSING_ID: Id = Id::MAX;
 const INVALID_EVENT_TS: i64 = i64::MIN;
@@ -299,10 +302,7 @@ impl BorrowedInterner {
         Self {
             values: Vec::with_capacity(users),
             ids: fast_map_with_capacity(bytes / 1000),
-            users: PackedUserMap::with_capacity_and_hasher(
-                users,
-                BuildHasherDefault::default(),
-            ),
+            users: PackedUserMap::with_capacity_and_hasher(users, BuildHasherDefault::default()),
         }
     }
 
@@ -435,14 +435,18 @@ impl Event {
         if bytes == [u8::MAX; 6] {
             INVALID_EVENT_TS
         } else {
-            i64::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], 0, 0])
+            i64::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], 0, 0,
+            ])
         }
     }
 
     #[inline]
     fn timestamp_key(self) -> u64 {
         let bytes = self.ts;
-        u64::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], 0, 0])
+        u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], 0, 0,
+        ])
     }
 }
 
