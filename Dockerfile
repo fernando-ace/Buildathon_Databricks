@@ -2,8 +2,7 @@ FROM rust:1.100-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock* ./
 COPY src ./src
-ARG TARGET_CPU=cascadelake
-ENV RUSTFLAGS="-C target-cpu=${TARGET_CPU} -C target-feature=+crt-static"
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+crt-static"
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
