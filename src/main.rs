@@ -751,24 +751,19 @@ fn price(bytes: &[u8]) -> Option<i64> {
 
 #[inline]
 fn packed_user_id(bytes: &[u8]) -> Option<u64> {
-    fixed_width_id(bytes, b'u')
-}
-
-#[inline]
-fn fixed_width_id(bytes: &[u8], prefix: u8) -> Option<u64> {
-    (bytes.len() == 9 && bytes[0] == prefix)
-        .then(|| u64::from_ne_bytes(bytes[1..9].try_into().unwrap()))
-}
-
-#[inline]
-fn event_id_hash(bytes: &[u8]) -> u64 {
-    let mut hasher = AHasher::default();
-    if let Some(key) = fixed_width_id(bytes, b'e') {
-        hasher.write_u64(key);
-    } else {
-        hasher.write(bytes);
+    if bytes.len() != 9 || bytes[0] != b'u' {
+        return None;
     }
-    hasher.finish()
+    let mut packed = 0u64;
+    for &byte in &bytes[1..] {
+        let digit = match byte {
+            b'0'..=b'9' => u64::from(byte - b'0'),
+            b'a'..=b'z' => u64::from(byte - b'a' + 10),
+            _ => return None,
+        };
+        packed = packed * 36 + digit;
+    }
+    Some(packed)
 }
 
 fn each_row_bytes<const N: usize, F>(bytes: &[u8], mut f: F)
@@ -902,7 +897,9 @@ fn parse_event_chunk(
             },
         };
         let id = StrRef::new(row[0]);
-        events.push((event_id_hash(row[0]), id, event));
+        let mut hasher = AHasher::default();
+        hasher.write(row[0]);
+        events.push((hasher.finish(), id, event));
     });
     (strings, events)
 }
