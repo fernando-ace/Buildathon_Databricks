@@ -353,10 +353,10 @@ impl Dsu {
 }
 
 #[derive(Clone, Copy)]
-#[repr(C)]
+#[repr(C, packed)]
 struct Event {
     ids: u64,
-    ts: i64,
+    ts: [u8; 6],
     ingest_seconds: u32,
     payload: u32,
 }
@@ -364,9 +364,13 @@ struct Event {
 impl Event {
     #[inline]
     fn new(ts: i64, ingest_ms: i64, user: Id, product: Id, price: u32, kind: u8) -> Self {
+        let mut compact_ts = [u8::MAX; 6];
+        if (0..(1i64 << 48)).contains(&ts) {
+            compact_ts.copy_from_slice(&ts.to_le_bytes()[..6]);
+        }
         Self {
             ids: u64::from(user) | (u64::from(product) << 32),
-            ts,
+            ts: compact_ts,
             // Generated datasets and all track fixtures use positive F1 ingest
             // timestamps between 2025 and 2028, which fit in u32 seconds.
             ingest_seconds: (ingest_ms / 1_000) as u32,
@@ -403,9 +407,25 @@ impl Event {
     fn price(self) -> u32 {
         self.payload & 0x00ff_ffff
     }
+
+    #[inline]
+    fn timestamp(self) -> i64 {
+        let bytes = self.ts;
+        if bytes == [u8::MAX; 6] {
+            INVALID_EVENT_TS
+        } else {
+            i64::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], 0, 0])
+        }
+    }
+
+    #[inline]
+    fn timestamp_key(self) -> u64 {
+        let bytes = self.ts;
+        u64::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], 0, 0])
+    }
 }
 
-const _: () = assert!(std::mem::size_of::<Event>() == 24);
+const _: () = assert!(std::mem::size_of::<Event>() == 22);
 
 #[derive(Clone, Copy)]
 struct Click {
@@ -464,7 +484,7 @@ fn aggregate_user_group(
     sessions: &mut Vec<Session>,
 ) {
     let person = events[0].user();
-    let first_ts = events[0].ts;
+    let first_ts = events[0].timestamp();
     let mut session_start = first_ts;
     let mut session_day = day(first_ts);
     let mut user_day = session_day;
@@ -474,7 +494,7 @@ fn aggregate_user_group(
     let mut previous_ts = first_ts;
 
     for (index, event) in events.iter().enumerate() {
-        let ts = event.ts;
+        let ts = event.timestamp();
         let new_session = index == 0 || ts - previous_ts > SESSION_GAP_MS;
         if index > 0 && new_session {
             sessions.push(Session {
@@ -1485,17 +1505,18 @@ fn run() -> Result<(), String> {
 
     let mut surviving = events;
     surviving.retain_mut(|e| {
+        let ts = e.timestamp();
         if e.user() == MISSING_ID
-            || e.ts == INVALID_EVENT_TS
-            || e.ts < start
-            || e.ts >= end
+            || ts == INVALID_EVENT_TS
+            || ts < start
+            || ts >= end
             || e.product() == MISSING_ID
             || e.kind() > 2
             || (e.kind() == 2 && e.price() == INVALID_PRICE_CENTS)
         {
             return false;
         }
-        if i128::from(e.ingest_seconds) * 1_000 - i128::from(e.ts) > 86_400_000 {
+        if i128::from(e.ingest_seconds) * 1_000 - i128::from(ts) > 86_400_000 {
             return false;
         }
         e.set_user(dsu.canonical(e.user()));
@@ -1519,7 +1540,7 @@ fn run() -> Result<(), String> {
 
     let phase = Instant::now();
     rayon::join(
-        || surviving.par_sort_unstable_by_key(|e| (e.user(), e.ts)),
+        || surviving.par_sort_unstable_by_key(|e| (e.user(), e.timestamp_key())),
         || raw_clicks.par_sort_unstable_by_key(|c| (c.user, c.ts)),
     );
     eprintln!(
