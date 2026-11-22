@@ -204,7 +204,6 @@ struct Interner {
     values: Vec<StrRef>,
     arena: StringArena,
     ids: FastMap<StrRef, Id>,
-    users: PackedUserMap,
 }
 
 impl Interner {
@@ -217,20 +216,6 @@ impl Interner {
         let id = self.values.len() as Id;
         self.values.push(key);
         self.ids.insert(key, id);
-        id
-    }
-
-    fn intern_user(&mut self, bytes: &[u8]) -> Id {
-        let Some(key) = packed_user_id(bytes) else {
-            return self.intern(text(bytes).unwrap());
-        };
-        if let Some(&id) = self.users.get(&key) {
-            return id;
-        }
-        let id = self.values.len() as Id;
-        let value = self.arena.store(bytes);
-        self.values.push(value);
-        self.users.insert(key, id);
         id
     }
 
@@ -882,7 +867,7 @@ fn parse_links(data: &Path, strings: &mut Interner) -> Result<Vec<(Id, Id)>, Str
         each_row::<2, _>(&path, |row| {
             if let (Some(a), Some(b)) = (text(row[0]), text(row[1])) {
                 if !a.is_empty() && !b.is_empty() {
-                    links.push((strings.intern_user(row[0]), strings.intern_user(row[1])));
+                    links.push((strings.intern(a), strings.intern(b)));
                 }
             }
         })?;
@@ -1034,13 +1019,7 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
                     let remap = local_strings
                         .values
                         .iter()
-                        .map(|value| {
-                            if packed_user_id(value.bytes()).is_some() {
-                                strings.intern_user(value.bytes())
-                            } else {
-                                strings.intern(text(value.bytes()).unwrap())
-                            }
-                        })
+                        .map(|value| strings.intern(text(value.bytes()).unwrap()))
                         .collect::<Vec<_>>();
                     (local_events, remap)
                 })
@@ -1153,13 +1132,7 @@ fn parse_clicks(
             let remap = local_strings
                 .values
                 .iter()
-                .map(|value| {
-                    if packed_user_id(value.bytes()).is_some() {
-                        strings.intern_user(value.bytes())
-                    } else {
-                        strings.intern(text(value.bytes()).unwrap())
-                    }
-                })
+                .map(|value| strings.intern(text(value.bytes()).unwrap()))
                 .collect::<Vec<_>>();
             for mut click in local_clicks {
                 click.user = remap[click.user as usize];
