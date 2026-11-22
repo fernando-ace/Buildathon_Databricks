@@ -226,10 +226,21 @@ struct Interner {
     values: Vec<StrRef>,
     arena: StringArena,
     ids: FastMap<StrRef, Id>,
+    users: PackedUserMap,
 }
 
 impl Interner {
     fn intern(&mut self, text: &str) -> Id {
+        if let Some(key) = packed_user_id(text.as_bytes()) {
+            if let Some(&id) = self.users.get(&key) {
+                return id;
+            }
+            let key_ref = self.arena.store(text.as_bytes());
+            let id = self.values.len() as Id;
+            self.values.push(key_ref);
+            self.users.insert(key, id);
+            return id;
+        }
         let lookup = StrRef::new(text.as_bytes());
         if let Some(&id) = self.ids.get(&lookup) {
             return id;
@@ -939,9 +950,14 @@ fn packed_fixed_id(bytes: &[u8], prefix: u8) -> Option<u64> {
 
 #[inline]
 fn spread_fixed_id(packed: u64) -> u64 {
-    // An odd multiplier is a permutation of u64. It preserves exact keys while
-    // moving fixed-width ID bytes into hashbrown's high-bit tags.
-    packed.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    // SplitMix's finalizer is a permutation of u64. Its xor-shifts spread both
+    // bucket-index and fingerprint bits without sacrificing exact key identity.
+    let mut mixed = packed;
+    mixed ^= mixed >> 30;
+    mixed = mixed.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    mixed ^= mixed >> 27;
+    mixed = mixed.wrapping_mul(0x94d0_49bb_1331_11eb);
+    mixed ^ (mixed >> 31)
 }
 
 #[inline]
@@ -1151,6 +1167,7 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
         buckets[bucket].push(path);
     }
     let estimated_events = bucket_bytes.iter().sum::<u64>() as usize / 82;
+    strings.users.reserve(estimated_events / 12);
     let shard_capacity = estimated_events.div_ceil(ncpu);
     let mut shards = (0..ncpu)
         .map(|_| EventShard::with_capacity(shard_capacity))
