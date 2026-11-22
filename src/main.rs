@@ -1212,7 +1212,6 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
         buckets[bucket].push(path);
     }
     let estimated_events = bucket_bytes.iter().sum::<u64>() as usize / 82;
-    strings.users.reserve(estimated_events / 12);
     let shard_capacity = estimated_events.div_ceil(ncpu);
     let mut shards = (0..ncpu)
         .map(|_| EventShard::with_capacity(shard_capacity))
