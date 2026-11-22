@@ -286,7 +286,7 @@ impl BorrowedInterner {
         let users = bytes / 320;
         Self {
             values: Vec::with_capacity(users),
-            ids: fast_map_with_capacity(bytes / 8192),
+            ids: fast_map_with_capacity(bytes / 1000),
             users: PackedUserMap::with_capacity_and_hasher(
                 users,
                 BuildHasherDefault::default(),
