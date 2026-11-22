@@ -402,6 +402,12 @@ struct RawClick {
     campaign: Id,
 }
 
+struct PendingClickFile {
+    source: Box<[u8]>,
+    strings: BorrowedInterner,
+    clicks: Vec<RawClick>,
+}
+
 #[derive(Clone, Copy)]
 struct Session {
     person: Id,
@@ -1281,50 +1287,66 @@ fn parse_click_file(path: &Path) -> Result<(Box<[u8]>, BorrowedInterner, Vec<Raw
     Ok((bytes, strings, clicks))
 }
 
-fn parse_clicks(
-    data: &Path,
-    strings: &mut Interner,
-    ncpu: usize,
-) -> Result<(Vec<Box<[u8]>>, Vec<RawClick>), String> {
+fn parse_clicks(data: &Path, ncpu: usize) -> Result<Vec<PendingClickFile>, String> {
     let paths = csv_files(&data.join("clicks"))?;
     let mut seen = (0..ncpu).map(|_| fast_set()).collect::<Vec<_>>();
-    let mut source_buffers = Vec::with_capacity(paths.len());
-    let mut clicks = Vec::new();
-    for batch in paths.chunks(paths.len().max(1)) {
-        let parsed = batch
-            .par_iter()
-            .map(|path| parse_click_file(path))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut partitions = (0..ncpu).map(|_| Vec::new()).collect::<Vec<_>>();
-        for (source, local_strings, local_clicks) in parsed {
-            source_buffers.push(source);
-            let remap = local_strings
-                .values
-                .iter()
-                .map(|value| strings.intern(text(value.bytes()).unwrap()))
-                .collect::<Vec<_>>();
-            for mut click in local_clicks {
-                click.user = remap[click.user as usize];
-                click.campaign = remap[click.campaign as usize];
-                let mut hasher = AHasher::default();
-                hasher.write(click.id.bytes());
-                let hash = hasher.finish();
-                partitions[partition_index(hash, ncpu)].push(click);
-            }
+    let mut files = paths
+        .par_iter()
+        .map(|path| parse_click_file(path))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|(source, strings, clicks)| PendingClickFile {
+            source,
+            strings,
+            clicks,
+        })
+        .collect::<Vec<_>>();
+    let mut partitions = (0..ncpu).map(|_| Vec::new()).collect::<Vec<_>>();
+    for (file_id, file) in files.iter_mut().enumerate() {
+        for click in std::mem::take(&mut file.clicks) {
+            let mut hasher = AHasher::default();
+            hasher.write(click.id.bytes());
+            let hash = hasher.finish();
+            partitions[partition_index(hash, ncpu)].push((file_id, click));
         }
-        let added = seen
-            .par_iter_mut()
-            .zip(partitions.into_par_iter())
-            .map(|(seen, candidates)| {
-                candidates
-                    .into_iter()
-                    .filter(|click| seen.insert(click.id))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        clicks.extend(added.into_iter().flatten());
     }
-    Ok((source_buffers, clicks))
+    let added = seen
+        .par_iter_mut()
+        .zip(partitions.into_par_iter())
+        .map(|(seen, candidates)| {
+            candidates
+                .into_iter()
+                .filter(|(_, click)| seen.insert(click.id))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    for (file_id, click) in added.into_iter().flatten() {
+        files[file_id].clicks.push(click);
+    }
+    Ok(files)
+}
+
+fn remap_clicks(
+    files: Vec<PendingClickFile>,
+    strings: &mut Interner,
+) -> (Vec<Box<[u8]>>, Vec<RawClick>) {
+    let mut source_buffers = Vec::with_capacity(files.len());
+    let mut clicks = Vec::new();
+    for file in files {
+        let remap = file
+            .strings
+            .values
+            .iter()
+            .map(|value| strings.intern(text(value.bytes()).unwrap()))
+            .collect::<Vec<_>>();
+        source_buffers.push(file.source);
+        clicks.extend(file.clicks.into_iter().map(|mut click| {
+            click.user = remap[click.user as usize];
+            click.campaign = remap[click.campaign as usize];
+            click
+        }));
+    }
+    (source_buffers, clicks)
 }
 
 fn day(ts: i64) -> i32 {
@@ -1404,15 +1426,20 @@ fn run() -> Result<(), String> {
         phase.elapsed().as_secs_f64()
     );
     let phase = Instant::now();
-    let events = parse_events(&data, &mut strings, ncpu)?;
+    let (events, click_files) = rayon::join(
+        || parse_events(&data, &mut strings, ncpu),
+        || parse_clicks(&data, ncpu),
+    );
+    let events = events?;
+    let click_files = click_files?;
     eprintln!(
-        "parsed and deduplicated events in {:.3}s",
+        "parsed and deduplicated event and click files in {:.3}s",
         phase.elapsed().as_secs_f64()
     );
     let phase = Instant::now();
-    let (click_sources, mut raw_clicks) = parse_clicks(&data, &mut strings, ncpu)?;
+    let (click_sources, mut raw_clicks) = remap_clicks(click_files, &mut strings);
     eprintln!(
-        "parsed and deduplicated clicks in {:.3}s",
+        "remapped click IDs in {:.3}s",
         phase.elapsed().as_secs_f64()
     );
     let mut dsu = Dsu::new(strings.values.len());
