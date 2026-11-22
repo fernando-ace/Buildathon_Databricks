@@ -100,8 +100,6 @@ struct EventShard {
     ids: Vec<u8>,
 }
 
-const PACKED_EVENT_ID: u64 = 1 << 63;
-
 impl EventShard {
     fn with_capacity(capacity: usize) -> Self {
         Self {
@@ -118,8 +116,8 @@ impl EventShard {
         }
     }
 
-    fn insert(&mut self, hash: u64, id: StrRef, event: Event) {
-        if hash & PACKED_EVENT_ID != 0 {
+    fn insert(&mut self, hash: u64, id: StrRef, event: Event, packed: bool) {
+        if packed {
             match self.primary.entry(hash) {
                 hashbrown::hash_map::Entry::Vacant(entry) => {
                     entry.insert(event);
@@ -939,7 +937,9 @@ fn packed_event_id(bytes: &[u8]) -> Option<u64> {
         };
         packed = packed * 36 + digit;
     }
-    Some(PACKED_EVENT_ID | packed)
+    // Keep this an injective key while spreading its high bits: hashbrown uses
+    // the top seven bits as its control-byte fingerprint.
+    Some(packed.wrapping_mul(0x9e37_79b9_7f4a_7c15))
 }
 
 fn each_row_bytes<const N: usize, F>(bytes: &[u8], mut f: F)
@@ -1078,7 +1078,7 @@ fn parse_event_chunk(
             hasher.write(row[0]);
             let index = fallback_ids.len() as Id;
             fallback_ids.push(StrRef::new(row[0]));
-            (hasher.finish() & !PACKED_EVENT_ID, index)
+            (hasher.finish(), index)
         };
         events.push((id_key, fallback_id, event));
     });
@@ -1229,7 +1229,7 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
                         } else {
                             fallback_ids[fallback_id as usize]
                         };
-                        shard.insert(hash, event_id, event);
+                        shard.insert(hash, event_id, event, fallback_id == MISSING_ID);
                     }
                 }
             });
