@@ -564,6 +564,16 @@ fn fast_set_with_capacity<K: std::hash::Hash + Eq>(capacity: usize) -> FastSet<K
     HashSet::with_capacity_and_hasher(capacity, RandomState::new())
 }
 
+#[inline]
+fn partition_index(hash: u64, partitions: usize) -> usize {
+    let hash = hash as usize;
+    if partitions.is_power_of_two() {
+        hash & (partitions - 1)
+    } else {
+        hash % partitions
+    }
+}
+
 fn csv_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut paths = fs::read_dir(dir)
         .map_err(|e| format!("read {}: {e}", dir.display()))?
@@ -1190,7 +1200,7 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
                         if product != MISSING_ID && event.kind() == 2 {
                             event.set_product(remap[product as usize]);
                         }
-                        partitions[hash as usize % ncpu].push((hash, fallback_id, event));
+                        partitions[partition_index(hash, ncpu)].push((hash, fallback_id, event));
                     }
                 }
                 (source, fallback_ids, partitions)
@@ -1299,7 +1309,7 @@ fn parse_clicks(
                 let mut hasher = AHasher::default();
                 hasher.write(click.id.bytes());
                 let hash = hasher.finish();
-                partitions[hash as usize % ncpu].push(click);
+                partitions[partition_index(hash, ncpu)].push(click);
             }
         }
         let added = seen
