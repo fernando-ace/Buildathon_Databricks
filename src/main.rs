@@ -239,6 +239,14 @@ struct Interner {
 }
 
 impl Interner {
+    fn lookup(&self, bytes: &[u8]) -> Option<Id> {
+        if let Some(key) = packed_user_id(bytes) {
+            self.users.get(&key).copied()
+        } else {
+            self.ids.get(&StrRef::new(bytes)).copied()
+        }
+    }
+
     fn intern(&mut self, text: &str) -> Id {
         if let Some(key) = packed_user_id(text.as_bytes()) {
             if let Some(&id) = self.users.get(&key) {
@@ -1230,15 +1238,39 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
             .par_iter()
             .map(|path| parse_event_file(path))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut prepared = Vec::with_capacity(parsed.len());
-        for (source, chunks) in parsed {
+        let probed = parsed
+            .into_par_iter()
+            .map(|(source, chunks)| {
+                let chunks = chunks
+                    .into_par_iter()
+                    .map(|(local_strings, fallback_ids, local_events)| {
+                        let known_ids = local_strings
+                            .values
+                            .par_iter()
+                            .map(|value| strings.lookup(value.bytes()).unwrap_or(MISSING_ID))
+                            .collect::<Vec<_>>();
+                        (local_strings, known_ids, fallback_ids, local_events)
+                    })
+                    .collect::<Vec<_>>();
+                (source, chunks)
+            })
+            .collect::<Vec<_>>();
+        let mut prepared = Vec::with_capacity(probed.len());
+        for (source, chunks) in probed {
             let chunks = chunks
                 .into_iter()
-                .map(|(local_strings, fallback_ids, local_events)| {
+                .map(|(local_strings, known_ids, fallback_ids, local_events)| {
                     let remap = local_strings
                         .values
                         .iter()
-                        .map(|value| strings.intern(text(value.bytes()).unwrap()))
+                        .zip(known_ids)
+                        .map(|(value, known)| {
+                            if known == MISSING_ID {
+                                strings.intern(text(value.bytes()).unwrap())
+                            } else {
+                                known
+                            }
+                        })
                         .collect::<Vec<_>>();
                     (local_events, remap, fallback_ids)
                 })
