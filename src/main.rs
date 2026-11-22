@@ -579,6 +579,15 @@ fn two_digits(bytes: &[u8], at: usize) -> Option<i64> {
 }
 
 #[inline]
+fn two_digits_packed(bytes: &[u8], at: usize) -> Option<i64> {
+    let pair = u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+    if pair & 0xf0f0 != 0x3030 {
+        return None;
+    }
+    Some(i64::from(pair & 0x0f) * 10 + i64::from((pair >> 8) & 0x0f))
+}
+
+#[inline]
 fn four_digits(bytes: &[u8], at: usize) -> Option<i64> {
     Some(
         digit(bytes[at])? * 1_000
@@ -667,6 +676,55 @@ fn f1_timestamp_unchecked(bytes: &[u8], years: &mut YearStartCache) -> i64 {
 }
 
 fn timestamp_with_cache(bytes: &[u8], years: &mut YearStartCache) -> Option<i64> {
+    if bytes.len() == 20
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b'T'
+        && bytes[13] == b':'
+        && bytes[16] == b':'
+        && bytes[19] == b'Z'
+    {
+        let year = two_digits_packed(bytes, 0)? * 100 + two_digits_packed(bytes, 2)?;
+        let month = two_digits_packed(bytes, 5)?;
+        let date = two_digits_packed(bytes, 8)?;
+        let hour = two_digits_packed(bytes, 11)?;
+        let minute = two_digits_packed(bytes, 14)?;
+        let second = two_digits_packed(bytes, 17)?;
+        if year == 0 || month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59 {
+            return None;
+        }
+        let month_start = match month {
+            1 => 0,
+            2 => 31,
+            3 => 59,
+            4 => 90,
+            5 => 120,
+            6 => 151,
+            7 => 181,
+            8 => 212,
+            9 => 243,
+            10 => 273,
+            11 => 304,
+            _ => 334,
+        };
+        let month_days = match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if leap(year) => 29,
+            2 => 28,
+            _ => unreachable!(),
+        };
+        if date < 1 || date > month_days {
+            return None;
+        }
+        let day_of_year = month_start + i64::from(month > 2 && leap(year)) + date - 1;
+        return Some(
+            (years.get(year) + day_of_year) * DAY_MS
+                + hour * 3_600_000
+                + minute * 60_000
+                + second * 1_000,
+        );
+    }
     if bytes.len() != 20 && bytes.len() != 25 || bytes.get(4) != Some(&b'-') {
         return ascii_u64(bytes).and_then(|n| i64::try_from(n).ok());
     }
