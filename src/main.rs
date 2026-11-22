@@ -1178,7 +1178,7 @@ fn parse_event_file(
     ),
     String,
 > {
-    const CHUNK_SIZE: usize = 32 * 1024 * 1024;
+    const CHUNK_SIZE: usize = 8 * 1024 * 1024;
     let bytes = fs::read(path)
         .map_err(|e| format!("read {}: {e}", path.display()))?
         .into_boxed_slice();
