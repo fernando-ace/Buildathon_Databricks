@@ -204,8 +204,8 @@ impl EventShard {
 }
 
 const DAY_MS: i64 = 86_400_000;
-// The v5 pipeline is faster with six workers under the track's eight-vCPU cap.
-const MAX_WORKERS: usize = 6;
+// The v5 pipeline is faster with seven workers under the track's eight-vCPU cap.
+const MAX_WORKERS: usize = 7;
 const SESSION_GAP_MS: i64 = 1_800_000;
 const ATTRIBUTION_MS: i64 = 604_800_000;
 
