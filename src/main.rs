@@ -1461,8 +1461,10 @@ fn run() -> Result<(), String> {
     );
 
     let phase = Instant::now();
-    surviving.par_sort_unstable_by_key(|e| (e.user(), e.ts));
-    raw_clicks.par_sort_unstable_by_key(|c| (c.user, c.ts));
+    rayon::join(
+        || surviving.par_sort_unstable_by_key(|e| (e.user(), e.ts)),
+        || raw_clicks.par_sort_unstable_by_key(|c| (c.user, c.ts)),
+    );
     eprintln!(
         "sorted events and clicks in {:.3}s",
         phase.elapsed().as_secs_f64()
