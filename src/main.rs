@@ -117,7 +117,9 @@ impl EventShard {
                 BuildHasherDefault::default(),
             ),
             fallback: ShardEventMap::with_capacity_and_hasher(
-                capacity / 100,
+                // V5 keeps one in eight event IDs at variable width, so size
+                // the fallback table for that generator guarantee.
+                capacity / 8,
                 BuildHasherDefault::default(),
             ),
             collisions: fast_map(),
@@ -199,6 +201,8 @@ impl EventShard {
 }
 
 const DAY_MS: i64 = 86_400_000;
+// The v5 pipeline is faster with six workers under the track's eight-vCPU cap.
+const MAX_WORKERS: usize = 6;
 const SESSION_GAP_MS: i64 = 1_800_000;
 const ATTRIBUTION_MS: i64 = 604_800_000;
 
@@ -1109,7 +1113,7 @@ fn parse_event_chunk(
 ) -> (BorrowedInterner, Vec<StrRef>, Vec<EventRecord>) {
     let mut strings = BorrowedInterner::for_event_chunk(bytes.len());
     let mut events = Vec::with_capacity(bytes.len() / 76);
-    let mut fallback_ids = Vec::new();
+    let mut fallback_ids = Vec::with_capacity(bytes.len() / 640);
     let mut years = YearStartCache::default();
     each_utf8_row_bytes::<7, _>(bytes, skip_header, |row| {
         if row[0].is_empty() {
@@ -1495,7 +1499,8 @@ fn run() -> Result<(), String> {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from));
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, usize::from))
+        .min(MAX_WORKERS);
     rayon::ThreadPoolBuilder::new()
         .num_threads(ncpu)
         .build_global()
