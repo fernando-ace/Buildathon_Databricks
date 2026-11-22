@@ -363,11 +363,13 @@ const _: () = assert!(std::mem::size_of::<Event>() == 24);
 
 #[derive(Clone, Copy)]
 struct Click {
-    id: StrRef,
+    id_key: u64,
     user: Id,
     ts: i64,
     campaign: Id,
 }
+
+const FALLBACK_CLICK_ID: u64 = 1 << 63;
 
 #[derive(Clone, Copy)]
 struct RawClick {
@@ -469,6 +471,7 @@ fn aggregate_user_group(
 fn attribute_user_sessions(
     sessions: &[Session],
     clicks: &[Click],
+    other_click_ids: &[StrRef],
     organic: Id,
     daily: &mut FastMap<(Id, i32), CampaignAgg>,
     active: &mut VecDeque<Click>,
@@ -481,7 +484,9 @@ fn attribute_user_sessions(
         while add < clicks.len() && clicks[add].ts <= session.start {
             let click = clicks[add];
             while active.back().is_some_and(|last| {
-                click.ts > last.ts || (click.ts == last.ts && click.id.bytes() < last.id.bytes())
+                click.ts > last.ts
+                    || (click.ts == last.ts
+                        && click_id_cmp(click.id_key, last.id_key, other_click_ids).is_lt())
             }) {
                 active.pop_back();
             }
@@ -840,6 +845,42 @@ fn timestamp_with_cache(bytes: &[u8], years: &mut YearStartCache) -> Option<i64>
 fn price(bytes: &[u8]) -> Option<i64> {
     let n = ascii_u64(bytes)?;
     (1..=10_000_000).contains(&n).then_some(n as i64)
+}
+
+#[inline]
+fn fixed_click_order_key(bytes: &[u8]) -> Option<u64> {
+    (bytes.len() == 9
+        && bytes[0] == b'c'
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'z').contains(byte)))
+    .then(|| u64::from_be_bytes(bytes[1..9].try_into().unwrap()))
+}
+
+#[inline]
+fn fixed_click_bytes(key: u64) -> [u8; 9] {
+    let mut bytes = [0u8; 9];
+    bytes[0] = b'c';
+    bytes[1..].copy_from_slice(&key.to_be_bytes());
+    bytes
+}
+
+#[inline]
+fn click_id_cmp(a: u64, b: u64, other_click_ids: &[StrRef]) -> std::cmp::Ordering {
+    let a_other = a & FALLBACK_CLICK_ID != 0;
+    let b_other = b & FALLBACK_CLICK_ID != 0;
+    match (a_other, b_other) {
+        (false, false) => a.cmp(&b),
+        (true, true) => other_click_ids[(a & !FALLBACK_CLICK_ID) as usize]
+            .bytes()
+            .cmp(other_click_ids[(b & !FALLBACK_CLICK_ID) as usize].bytes()),
+        (false, true) => fixed_click_bytes(a)
+            .as_slice()
+            .cmp(other_click_ids[(b & !FALLBACK_CLICK_ID) as usize].bytes()),
+        (true, false) => other_click_ids[(a & !FALLBACK_CLICK_ID) as usize]
+            .bytes()
+            .cmp(fixed_click_bytes(b).as_slice()),
+    }
 }
 
 #[inline]
@@ -1398,13 +1439,21 @@ fn run() -> Result<(), String> {
         phase.elapsed().as_secs_f64()
     );
     let phase = Instant::now();
+    let mut other_click_ids = Vec::new();
     let clicks = raw_clicks
         .into_iter()
-        .map(|click| Click {
-            id: click.id,
-            user: click.user,
-            ts: click.ts,
-            campaign: click.campaign,
+        .map(|click| {
+            let id_key = fixed_click_order_key(click.id.bytes()).unwrap_or_else(|| {
+                let index = other_click_ids.len() as u64;
+                other_click_ids.push(click.id);
+                FALLBACK_CLICK_ID | index
+            });
+            Click {
+                id_key,
+                user: click.user,
+                ts: click.ts,
+                campaign: click.campaign,
+            }
         })
         .collect::<Vec<_>>();
     let mut attribution_ranges = Vec::new();
@@ -1437,6 +1486,7 @@ fn run() -> Result<(), String> {
                 attribute_user_sessions(
                     &sessions[session_start..session_end],
                     &clicks[click_start..click_end],
+                    &other_click_ids,
                     organic,
                     &mut daily,
                     &mut active,
