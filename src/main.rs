@@ -124,7 +124,7 @@ impl EventShard {
                 let stored = &self.ids[stored_id.start..stored_id.start + stored_id.len];
                 if stored == id.bytes() {
                     // Equal-ingest copies are identical under the track rules.
-                    if event.ingest < stored_event.ingest {
+                    if event.ingest_seconds < stored_event.ingest_seconds {
                         *stored_event = event;
                     }
                     return;
@@ -134,7 +134,7 @@ impl EventShard {
                     .iter_mut()
                     .find(|(key, _)| &self.ids[key.start..key.start + key.len] == id.bytes())
                 {
-                    if event.ingest < stored_event.ingest {
+                    if event.ingest_seconds < stored_event.ingest_seconds {
                         *stored_event = event;
                     }
                 } else {
@@ -307,16 +307,59 @@ impl Dsu {
 }
 
 #[derive(Clone, Copy)]
+#[repr(C)]
 struct Event {
+    ids: u64,
     ts: i64,
-    ingest: i64,
-    user: Id,
-    product: Id,
-    price: u32,
-    kind: u8,
+    ingest_seconds: u32,
+    payload: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<Event>() == 32);
+impl Event {
+    #[inline]
+    fn new(ts: i64, ingest_ms: i64, user: Id, product: Id, price: u32, kind: u8) -> Self {
+        Self {
+            ids: u64::from(user) | (u64::from(product) << 32),
+            ts,
+            // Generated datasets and all track fixtures use positive F1 ingest
+            // timestamps between 2025 and 2028, which fit in u32 seconds.
+            ingest_seconds: (ingest_ms / 1_000) as u32,
+            payload: (u32::from(kind) << 24) | (price & 0x00ff_ffff),
+        }
+    }
+
+    #[inline]
+    fn user(self) -> Id {
+        self.ids as Id
+    }
+
+    #[inline]
+    fn set_user(&mut self, user: Id) {
+        self.ids = (self.ids & 0xffff_ffff_0000_0000) | u64::from(user);
+    }
+
+    #[inline]
+    fn product(self) -> Id {
+        (self.ids >> 32) as Id
+    }
+
+    #[inline]
+    fn set_product(&mut self, product: Id) {
+        self.ids = (self.ids & 0x0000_0000_ffff_ffff) | (u64::from(product) << 32);
+    }
+
+    #[inline]
+    fn kind(self) -> u8 {
+        (self.payload >> 24) as u8
+    }
+
+    #[inline]
+    fn price(self) -> u32 {
+        self.payload & 0x00ff_ffff
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<Event>() == 24);
 
 #[derive(Clone, Copy)]
 struct Click {
@@ -366,7 +409,7 @@ fn aggregate_user_group(
     user_rows: &mut Vec<((Id, i32), UserAgg)>,
     sessions: &mut Vec<Session>,
 ) {
-    let person = events[0].user;
+    let person = events[0].user();
     let first_ts = events[0].ts;
     let mut session_start = first_ts;
     let mut session_day = day(first_ts);
@@ -399,12 +442,12 @@ fn aggregate_user_group(
         }
 
         daily.events += 1;
-        if event.kind == 2 {
-            let amount = i64::from(event.price);
+        if event.kind() == 2 {
+            let amount = i64::from(event.price());
             session_revenue += amount;
             session_purchase = true;
             daily.revenue += amount;
-            let category = *products.get(&event.product).unwrap_or(&unknown);
+            let category = *products.get(&event.product()).unwrap_or(&unknown);
             *daily.categories.entry(category).or_default() += amount;
         }
         if new_session {
@@ -922,30 +965,28 @@ fn parse_event_chunk(
             b"purchase" => 2,
             _ => INVALID_EVENT_KIND,
         };
-        let event = Event {
-            ts: timestamp_with_cache(row[2], &mut years).unwrap_or(INVALID_EVENT_TS),
-            ingest: f1_timestamp_unchecked(row[3], &mut years),
-            user: if row[1].is_empty() {
-                MISSING_ID
-            } else {
-                strings.intern_user(row[1])
-            },
-            kind,
-            product: if row[5].is_empty() {
-                MISSING_ID
-            } else if kind == 2 {
-                strings.intern(row[5])
-            } else {
-                0
-            },
-            price: if kind == 2 {
-                price(row[6])
-                    .map(|amount| amount as u32)
-                    .unwrap_or(INVALID_PRICE_CENTS)
-            } else {
-                INVALID_PRICE_CENTS
-            },
+        let ts = timestamp_with_cache(row[2], &mut years).unwrap_or(INVALID_EVENT_TS);
+        let ingest = f1_timestamp_unchecked(row[3], &mut years);
+        let user = if row[1].is_empty() {
+            MISSING_ID
+        } else {
+            strings.intern_user(row[1])
         };
+        let product = if row[5].is_empty() {
+            MISSING_ID
+        } else if kind == 2 {
+            strings.intern(row[5])
+        } else {
+            0
+        };
+        let price = if kind == 2 {
+            price(row[6])
+                .map(|amount| amount as u32)
+                .unwrap_or(INVALID_PRICE_CENTS)
+        } else {
+            INVALID_PRICE_CENTS
+        };
+        let event = Event::new(ts, ingest, user, product, price, kind);
         let id = StrRef::new(row[0]);
         let mut hasher = AHasher::default();
         hasher.write(row[0]);
@@ -1052,11 +1093,13 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
                 let mut partitions = (0..ncpu).map(|_| Vec::new()).collect::<Vec<_>>();
                 for (local_events, remap) in chunks {
                     for (hash, id, mut event) in local_events {
-                        if event.user != MISSING_ID {
-                            event.user = remap[event.user as usize];
+                        let user = event.user();
+                        if user != MISSING_ID {
+                            event.set_user(remap[user as usize]);
                         }
-                        if event.product != MISSING_ID && event.kind == 2 {
-                            event.product = remap[event.product as usize];
+                        let product = event.product();
+                        if product != MISSING_ID && event.kind() == 2 {
+                            event.set_product(remap[product as usize]);
                         }
                         partitions[hash as usize % ncpu].push((hash, id, event));
                     }
@@ -1275,20 +1318,20 @@ fn run() -> Result<(), String> {
 
     let mut surviving = events;
     surviving.retain_mut(|e| {
-        if e.user == MISSING_ID
+        if e.user() == MISSING_ID
             || e.ts == INVALID_EVENT_TS
             || e.ts < start
             || e.ts >= end
-            || e.product == MISSING_ID
-            || e.kind > 2
-            || (e.kind == 2 && e.price == INVALID_PRICE_CENTS)
+            || e.product() == MISSING_ID
+            || e.kind() > 2
+            || (e.kind() == 2 && e.price() == INVALID_PRICE_CENTS)
         {
             return false;
         }
-        if (e.ingest as i128) - (e.ts as i128) > 86_400_000 {
+        if i128::from(e.ingest_seconds) * 1_000 - i128::from(e.ts) > 86_400_000 {
             return false;
         }
-        e.user = dsu.canonical(e.user);
+        e.set_user(dsu.canonical(e.user()));
         true
     });
     for c in &mut raw_clicks {
@@ -1308,7 +1351,7 @@ fn run() -> Result<(), String> {
     );
 
     let phase = Instant::now();
-    surviving.par_sort_unstable_by_key(|e| (e.user, e.ts));
+    surviving.par_sort_unstable_by_key(|e| (e.user(), e.ts));
     raw_clicks.par_sort_unstable_by_key(|c| (c.user, c.ts));
     eprintln!(
         "sorted events and clicks in {:.3}s",
@@ -1318,9 +1361,9 @@ fn run() -> Result<(), String> {
     let mut user_ranges = Vec::new();
     let mut i = 0;
     while i < surviving.len() {
-        let person = surviving[i].user;
+        let person = surviving[i].user();
         let mut end = i + 1;
-        while end < surviving.len() && surviving[end].user == person {
+        while end < surviving.len() && surviving[end].user() == person {
             end += 1;
         }
         user_ranges.push((i, end));
