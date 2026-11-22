@@ -26,7 +26,16 @@ type FastSet<K> = HashSet<K, RandomState>;
 type PackedUserMap = hashbrown::HashMap<u64, Id, BuildHasherDefault<IdentityHasher>>;
 type ShardEventMap = hashbrown::HashMap<u64, (IdRef, Event), BuildHasherDefault<IdentityHasher>>;
 type PackedEventMap = hashbrown::HashMap<u64, Event, BuildHasherDefault<IdentityHasher>>;
-type EventRecord = (u64, Id, Event);
+
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+struct EventRecord {
+    hash: u64,
+    fallback_id: Id,
+    event: Event,
+}
+
+const _: () = assert!(std::mem::size_of::<EventRecord>() == 34);
 
 #[derive(Clone, Copy)]
 struct StrRef {
@@ -1135,7 +1144,11 @@ fn parse_event_chunk(
             fallback_ids.push(StrRef::new(row[0]));
             (hasher.finish(), index)
         };
-        events.push((id_key, fallback_id, event));
+        events.push(EventRecord {
+            hash: id_key,
+            fallback_id,
+            event,
+        });
     });
     (strings, fallback_ids, events)
 }
@@ -1241,7 +1254,12 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
                 for (local_events, remap, chunk_fallback_ids) in chunks {
                     let fallback_offset = fallback_ids.len() as Id;
                     fallback_ids.extend(chunk_fallback_ids);
-                    for (hash, fallback_id, mut event) in local_events {
+                    for EventRecord {
+                        hash,
+                        fallback_id,
+                        mut event,
+                    } in local_events
+                    {
                         let fallback_id = if fallback_id == MISSING_ID {
                             MISSING_ID
                         } else {
@@ -1255,7 +1273,11 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
                         if product != MISSING_ID && event.kind() == 2 {
                             event.set_product(remap[product as usize]);
                         }
-                        partitions[partition_index(hash, ncpu)].push((hash, fallback_id, event));
+                        partitions[partition_index(hash, ncpu)].push(EventRecord {
+                            hash,
+                            fallback_id,
+                            event,
+                        });
                     }
                 }
                 (source, fallback_ids, partitions)
@@ -1279,7 +1301,12 @@ fn parse_events(data: &Path, strings: &mut Interner, ncpu: usize) -> Result<Vec<
             .zip(partitions.into_par_iter())
             .for_each(|(shard, file_records)| {
                 for (records, fallback_ids) in file_records.into_iter().zip(&file_fallback_ids) {
-                    for (hash, fallback_id, event) in records {
+                    for EventRecord {
+                        hash,
+                        fallback_id,
+                        event,
+                    } in records
+                    {
                         let event_id = if fallback_id == MISSING_ID {
                             StrRef::new(&[])
                         } else {
